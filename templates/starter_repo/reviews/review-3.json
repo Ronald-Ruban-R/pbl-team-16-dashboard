@@ -1,0 +1,63 @@
+{
+  "_comment": "Starter template for reviews/review-3.json",
+  "review_id": "review-3",
+  "review_number": 3,
+  "review_name": "Review 3: Core Implementation, Experiments & Validation",
+  "scheduled_date": "YYYY-MM-DD",
+  "submission_deadline": "YYYY-MM-DD",
+  "submitted_at": null,
+  "submission_status": "Not Submitted",
+  "deliverables": [
+    {
+      "title": "Integrated Prototype / Core Implementation",
+      "required": true,
+      "submitted": false,
+      "artifact_path": "deliverables/",
+      "notes": ""
+    },
+    {
+      "title": "Experimental Validation & Test Results",
+      "required": true,
+      "submitted": false,
+      "artifact_path": "datasets/",
+      "notes": ""
+    }
+  ],
+  "evidence_links": {
+    "presentation": "",
+    "report": "",
+    "prototype": "",
+    "research": ""
+  },
+  "mentor_feedback": null,
+  "criteria_scores": [
+    {
+      "criterion": "Core Implementation Quality",
+      "max_score": 30.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Experimental Validation & Benchmarking",
+      "max_score": 30.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Competition / External Evaluation Readiness",
+      "max_score": 20.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Resolution of Review 2 Action Items",
+      "max_score": 20.0,
+      "awarded_score": null,
+      "comments": ""
+    }
+  ],
+  "strengths": [],
+  "concerns": [],
+  "improvement_areas": [],
+  "action_items": []
+}

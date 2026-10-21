@@ -1,0 +1,73 @@
+{
+  "_comment": "Starter template for reviews/review-1.json (replicate for review-2.json, review-3.json, review-4.json)",
+  "review_id": "review-1",
+  "review_number": 1,
+  "review_name": "Review 1: Problem Definition & Literature Survey",
+  "scheduled_date": "YYYY-MM-DD",
+  "submission_deadline": "YYYY-MM-DD",
+  "submitted_at": null,
+  "submission_status": "Not Submitted",
+  "deliverables": [
+    {
+      "title": "Problem Statement & Stakeholder Analysis",
+      "required": true,
+      "submitted": false,
+      "artifact_path": "project/metadata.json",
+      "notes": ""
+    },
+    {
+      "title": "Literature Review Summary",
+      "required": true,
+      "submitted": false,
+      "artifact_path": "research/",
+      "notes": ""
+    }
+  ],
+  "evidence_links": {
+    "presentation": "",
+    "report": "",
+    "prototype": "",
+    "research": ""
+  },
+  "mentor_feedback": null,
+  "criteria_scores": [
+    {
+      "criterion": "Problem Clarity & Stakeholder Relevance",
+      "max_score": 25.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Depth of Literature & Prior Art Review",
+      "max_score": 25.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Feasibility of Proposed Methodology & Architecture",
+      "max_score": 25.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Team Role Clarity & Milestone Planning",
+      "max_score": 25.0,
+      "awarded_score": null,
+      "comments": ""
+    }
+  ],
+  "strengths": [],
+  "concerns": [],
+  "improvement_areas": [],
+  "action_items": [
+    {
+      "action_id": "AI-1-1",
+      "description": "<ACTION_ITEM_DESCRIPTION>",
+      "assigned_to": "<STUDENT_FULL_NAME>",
+      "due_date": "YYYY-MM-DD",
+      "status": "Not Started",
+      "resolution_evidence": null,
+      "completed_date": null
+    }
+  ]
+}

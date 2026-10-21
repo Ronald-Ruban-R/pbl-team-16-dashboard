@@ -1,0 +1,13 @@
+{
+  "_comment": "Starter template for team/members.json — List 3 to 5 multidisciplinary team members.",
+  "members": [
+    {
+      "member_id": "M1",
+      "name": "<STUDENT_FULL_NAME>",
+      "github_username": "<GITHUB_HANDLE>",
+      "role": "<PROJECT_ROLE>",
+      "discipline": "<ACADEMIC_DISCIPLINE>",
+      "email": "<STUDENT_EMAIL>"
+    }
+  ]
+}

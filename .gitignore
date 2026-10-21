@@ -1,0 +1,31 @@
+# Streamlit secrets (NEVER commit real tokens, private keys, or password hashes)
+.streamlit/secrets.toml
+
+# Environment variables & private keys
+.env
+.env.*
+*.pem
+*.key
+
+# Local SQLite database & backups
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Python virtual environments & bytecode caches
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

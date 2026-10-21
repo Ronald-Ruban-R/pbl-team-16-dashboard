@@ -1,0 +1,56 @@
+{
+  "_comment": "Starter template for project/progress.json — Milestone weights must sum to 100.0.",
+  "last_updated": "YYYY-MM-DD",
+  "current_phase": "<CURRENT_PHASE_NAME>",
+  "overall_reported_pct": 0.0,
+  "summary": "<CONCISE_SUMMARY_OF_CURRENT_PROJECT_STATUS>",
+  "accomplishments_since_last_update": [
+    "<COMPLETED_WORK_ITEM_1>"
+  ],
+  "blockers": [],
+  "next_steps": [
+    "<NEXT_STEP_1>"
+  ],
+  "milestones": [
+    {
+      "milestone_id": "M1",
+      "title": "Problem Validation & Literature Review",
+      "status": "Not Started",
+      "weight": 20.0,
+      "completion_pct": 0.0,
+      "due_date": "YYYY-MM-DD",
+      "completed_date": null,
+      "evidence_path": "research/"
+    },
+    {
+      "milestone_id": "M2",
+      "title": "Architecture & System Design",
+      "status": "Not Started",
+      "weight": 25.0,
+      "completion_pct": 0.0,
+      "due_date": "YYYY-MM-DD",
+      "completed_date": null,
+      "evidence_path": "documentation/"
+    },
+    {
+      "milestone_id": "M3",
+      "title": "Prototype Implementation & Experimental Testing",
+      "status": "Not Started",
+      "weight": 30.0,
+      "completion_pct": 0.0,
+      "due_date": "YYYY-MM-DD",
+      "completed_date": null,
+      "evidence_path": "datasets/"
+    },
+    {
+      "milestone_id": "M4",
+      "title": "Final Evaluation, Documentation & Handover",
+      "status": "Not Started",
+      "weight": 25.0,
+      "completion_pct": 0.0,
+      "due_date": "YYYY-MM-DD",
+      "completed_date": null,
+      "evidence_path": "deliverables/"
+    }
+  ]
+}

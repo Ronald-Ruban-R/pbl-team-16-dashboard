@@ -1,0 +1,63 @@
+{
+  "_comment": "Starter template for reviews/review-4.json",
+  "review_id": "review-4",
+  "review_number": 4,
+  "review_name": "Review 4: Final Demonstration, Documentation & Handover",
+  "scheduled_date": "YYYY-MM-DD",
+  "submission_deadline": "YYYY-MM-DD",
+  "submitted_at": null,
+  "submission_status": "Not Submitted",
+  "deliverables": [
+    {
+      "title": "Final Technical Report & User Documentation",
+      "required": true,
+      "submitted": false,
+      "artifact_path": "documentation/",
+      "notes": ""
+    },
+    {
+      "title": "Final Presentation Deck & Demo Evidence",
+      "required": true,
+      "submitted": false,
+      "artifact_path": "deliverables/",
+      "notes": ""
+    }
+  ],
+  "evidence_links": {
+    "presentation": "",
+    "report": "",
+    "prototype": "",
+    "research": ""
+  },
+  "mentor_feedback": null,
+  "criteria_scores": [
+    {
+      "criterion": "End-to-End Solution & Final Demo",
+      "max_score": 35.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Documentation & Reproducibility",
+      "max_score": 25.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Research / Competition Outcomes",
+      "max_score": 20.0,
+      "awarded_score": null,
+      "comments": ""
+    },
+    {
+      "criterion": "Resolution of All Prior Action Items",
+      "max_score": 20.0,
+      "awarded_score": null,
+      "comments": ""
+    }
+  ],
+  "strengths": [],
+  "concerns": [],
+  "improvement_areas": [],
+  "action_items": []
+}

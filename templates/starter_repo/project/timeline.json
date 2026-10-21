@@ -1,0 +1,25 @@
+{
+  "_comment": "Starter template for project/timeline.json — Distinguish planned_date from actual_date.",
+  "events": [
+    {
+      "event_id": "EV-1",
+      "title": "Project Kickoff & Problem Scoping",
+      "category": "Milestone",
+      "planned_date": "YYYY-MM-DD",
+      "actual_date": null,
+      "status": "Not Started",
+      "delay_reason": null,
+      "evidence_path": "project/metadata.json"
+    },
+    {
+      "event_id": "EV-2",
+      "title": "Review 1 Assessment",
+      "category": "Review",
+      "planned_date": "YYYY-MM-DD",
+      "actual_date": null,
+      "status": "Not Started",
+      "delay_reason": null,
+      "evidence_path": "reviews/review-1.json"
+    }
+  ]
+}

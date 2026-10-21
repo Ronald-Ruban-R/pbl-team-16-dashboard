@@ -1,0 +1,17 @@
+{
+  "_comment": "Starter template for team/responsibilities.json",
+  "responsibilities": [
+    {
+      "member_id": "M1",
+      "member_name": "<STUDENT_FULL_NAME>",
+      "primary_areas": [
+        "<RESPONSIBILITY_AREA_1>",
+        "<RESPONSIBILITY_AREA_2>"
+      ],
+      "deliverables_owned": [
+        "<DELIVERABLE_PATH_OR_NAME>"
+      ],
+      "notes": ""
+    }
+  ]
+}

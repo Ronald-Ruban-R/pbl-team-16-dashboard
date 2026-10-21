@@ -1,0 +1,24 @@
+{
+  "_comment": "Starter template for project/metadata.json — Replace placeholder fields with actual team project information.",
+  "team_id": "<TEAM_ID_E.G._pbl-team-16>",
+  "team_name": "<TEAM_DISPLAY_NAME>",
+  "project_title": "<PROJECT_TITLE>",
+  "domain": "<TECHNICAL_OR_SOCIAL_IMPACT_DOMAIN>",
+  "problem_statement": "<DETAILED_PROBLEM_STATEMENT>",
+  "objectives": [
+    "<OBJECTIVE_1>",
+    "<OBJECTIVE_2>"
+  ],
+  "expected_outcomes": [
+    "<EXPECTED_OUTCOME_1>",
+    "<EXPECTED_OUTCOME_2>"
+  ],
+  "start_date": "YYYY-MM-DD",
+  "target_completion_date": "YYYY-MM-DD",
+  "lead_mentor": "<LEAD_MENTOR_NAME>",
+  "co_mentor": "<CO_MENTOR_NAME>",
+  "tags": [
+    "<DOMAIN_TAG_1>",
+    "<DOMAIN_TAG_2>"
+  ]
+}

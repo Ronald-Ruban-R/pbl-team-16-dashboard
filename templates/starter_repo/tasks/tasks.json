@@ -1,0 +1,21 @@
+{
+  "_comment": "Starter template for tasks/tasks.json — Status must be Not Started, In Progress, Blocked, or Completed.",
+  "tasks": [
+    {
+      "task_id": "T-101",
+      "title": "<TASK_TITLE>",
+      "description": "<TASK_DESCRIPTION>",
+      "assigned_to": "<STUDENT_FULL_NAME>",
+      "priority": "High",
+      "status": "Not Started",
+      "start_date": "YYYY-MM-DD",
+      "due_date": "YYYY-MM-DD",
+      "completed_date": null,
+      "related_milestone": "M1",
+      "related_review": "review-1",
+      "evidence_link": "research/",
+      "last_updated": "YYYY-MM-DD",
+      "weight": 1.0
+    }
+  ]
+}
