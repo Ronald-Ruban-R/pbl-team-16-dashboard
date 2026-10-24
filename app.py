@@ -19,6 +19,7 @@ from src.config import DashboardConfig, to_plain_dict
 from src.github_client import GitHubAuthProvider, GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser
 from src.storage import MentorLocalStore
+from src.ui_theme import apply_clean_theme
 from src.views.overview import render_overview_page
 from src.views.repo_explorer import render_repo_explorer_page
 from src.views.research_competitions import render_research_competitions_page
@@ -189,6 +190,8 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    apply_clean_theme()
+    st.session_state["_nav_options"] = list(NAVIGATION_PAGES)
 
     secrets_map = _load_streamlit_secrets()
     config, access_manager, github_client, local_store = _get_or_init_services(secrets_map)

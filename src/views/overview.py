@@ -1,10 +1,9 @@
 """
 Overall Mentor Dashboard & All-Teams Cohort Comparison View.
 
-Provides the consolidated landing page across all six teams (`pbl-team-13`..`pbl-team-18`),
-highlighting team status, hybrid progress vs. verified evidence, review stage completion,
-overdue tasks, stale updates, and actionable alerts while keeping GitHub commit activity
-strictly separate from project completion.
+Organized into clean, uncluttered tabs so the mentor sees high-level KPIs immediately
+and can switch smoothly between Team Cards, the Comparison Matrix, Visual Charts, and
+Cohort Alerts without endless vertical scrolling.
 """
 
 from __future__ import annotations
@@ -32,11 +31,11 @@ def render_overview_page(
     evaluations: Dict[str, TeamEvaluationSummary],
     config: DashboardConfig,
 ) -> None:
-    """Render the Overall Cohort Mentor Dashboard."""
-    st.subheader("Cohort-X Executive Overview (`PBL-Cohort-X-Teams-13-18`)")
+    """Render the decluttered Overall Cohort Mentor Dashboard."""
+    st.markdown("## 🧭 Cohort Executive Overview")
     st.caption(
-        "Consolidated real-time status across all authorized student repositories. "
-        "Project completion is derived strictly from structured tasks and milestones—never from commit counts."
+        f"Organization: `{config.github_org}` • Project completion is calculated strictly from "
+        "reported tasks and milestones (kept separate from GitHub commit activity)."
     )
 
     total_teams = len(evaluations)
@@ -49,36 +48,41 @@ def render_overview_page(
     total_unresolved_ais = sum(len(e.unresolved_action_items) for e in evaluations.values())
 
     col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Configured Teams", total_teams)
-    col2.metric("Accessible Repos", f"{accessible_teams}/{total_teams}")
-    col3.metric("Teams On Track", on_track_teams)
+    col1.metric("Teams", total_teams)
+    col2.metric("Connected", f"{accessible_teams}/{total_teams}")
+    col3.metric("On Track", on_track_teams)
     col4.metric("Need Attention", needs_attention_teams)
     col5.metric("Overdue Tasks", total_overdue_tasks)
     col6.metric("Open Action Items", total_unresolved_ais)
 
     # ------------------------------------------------------------------
-    # Filters & Search Bar
+    # Collapsible Filter & Sort Bar (keeps the main view clean)
     # ------------------------------------------------------------------
-    f_col1, f_col2, f_col3 = st.columns([2, 1.5, 1.5])
-    with f_col1:
-        search_query = st.text_input(
-            "Filter teams by name, domain, or problem statement",
-            value="",
-            placeholder="e.g., Healthcare, pbl-team-14, Smart Grid...",
-        ).strip().lower()
-    with f_col2:
-        status_filter = st.multiselect(
-            "Filter by Attention Status",
-            options=["On Track", "Needs Attention", "Critical / Blocked", "Unavailable"],
-            default=["On Track", "Needs Attention", "Critical / Blocked", "Unavailable"],
-        )
-    with f_col3:
-        sort_by = st.selectbox(
-            "Sort Teams By",
-            options=["Repository Name", "Attention Priority", "Reported Progress (High → Low)", "Overdue Tasks (High → Low)"],
-        )
+    with st.expander("🔍 Search, Filter & Sort Teams", expanded=False):
+        f_col1, f_col2, f_col3 = st.columns([2, 1.5, 1.5])
+        with f_col1:
+            search_query = st.text_input(
+                "Search by team name, domain, or problem statement",
+                value="",
+                placeholder="e.g., Healthcare, pbl-team-14, Smart Grid...",
+            ).strip().lower()
+        with f_col2:
+            status_filter = st.multiselect(
+                "Attention Status",
+                options=["On Track", "Needs Attention", "Critical / Blocked", "Unavailable"],
+                default=["On Track", "Needs Attention", "Critical / Blocked", "Unavailable"],
+            )
+        with f_col3:
+            sort_by = st.selectbox(
+                "Sort Teams By",
+                options=[
+                    "Repository Name",
+                    "Attention Priority",
+                    "Reported Progress (High → Low)",
+                    "Overdue Tasks (High → Low)",
+                ],
+            )
 
-    # Build comparison rows
     rows: List[Dict] = []
     filtered_evals: List[TeamEvaluationSummary] = []
 
@@ -152,131 +156,140 @@ def render_overview_page(
     else:
         rows.sort(key=lambda r: r["Repository"])
 
-    # ------------------------------------------------------------------
-    # Team Summary Cards with Quick Navigation
-    # ------------------------------------------------------------------
-    st.markdown("#### Team Quick-Access Cards")
-    if not filtered_evals:
-        st.info("No teams match the current filter criteria.")
-    else:
-        card_cols = st.columns(3)
-        for idx, ev in enumerate(filtered_evals):
-            with card_cols[idx % 3]:
-                with st.container(border=True):
-                    t_name = ev.metadata.team_name if ev.metadata else ev.repo_name
-                    st.markdown(f"**{t_name}** (`{ev.repo_name}`)")
-                    st.caption(
-                        f"{_attention_badge(ev.attention_level)} | Domain: "
-                        f"{ev.metadata.domain if ev.metadata else 'Not Reported'}"
-                    )
-                    if ev.hybrid_progress_pct is not None:
-                        st.progress(
-                            min(1.0, max(0.0, ev.hybrid_progress_pct / 100.0)),
-                            text=f"Hybrid Progress: {ev.hybrid_progress_pct:.1f}%",
-                        )
-                    else:
-                        st.progress(0.0, text=f"Progress: {ev.progress_display_status}")
-
-                    c_a, c_b = st.columns(2)
-                    c_a.caption(f"Review: **{ev.current_review_label}**")
-                    c_b.caption(
-                        f"Tasks: **{ev.task_metrics.completed_tasks}/{ev.task_metrics.total_tasks}** "
-                        f"({ev.task_metrics.overdue_tasks} overdue)"
-                    )
-
-                    b1, b2, b3 = st.columns(3)
-                    if b1.button("Workspace", key=f"nav_ws_{ev.repo_name}", use_container_width=True):
-                        st.session_state["selected_repo"] = ev.repo_name
-                        st.session_state["active_page"] = "Individual Team Workspace"
-                        st.rerun()
-                    if b2.button("Files", key=f"nav_ex_{ev.repo_name}", use_container_width=True):
-                        st.session_state["selected_repo"] = ev.repo_name
-                        st.session_state["active_page"] = "Repository Explorer"
-                        st.rerun()
-                    b3.link_button("GitHub ↗", ev.snapshot.html_url, use_container_width=True)
-
-    # ------------------------------------------------------------------
-    # Consolidated Comparison Table
-    # ------------------------------------------------------------------
-    st.markdown("#### Cross-Team Progress & Activity Matrix")
-    if rows:
-        display_df = pd.DataFrame(rows).drop(columns=["_sort_progress", "_sort_overdue", "_sort_attention"])
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "GitHub URL": st.column_config.LinkColumn("GitHub Repo", display_text="Open Repo ↗"),
-            },
-        )
-
-    # ------------------------------------------------------------------
-    # Visual Comparison Charts (Progress vs Evidence & Task Breakdown)
-    # ------------------------------------------------------------------
-    chart_col1, chart_col2 = st.columns(2)
-    with chart_col1:
-        st.markdown("#### Reported vs. Evidence-Verified Task Completion")
-        chart_rows = []
-        for ev in filtered_evals:
-            if ev.snapshot.accessible and ev.task_metrics.reported_completion_pct is not None:
-                chart_rows.append(
-                    {
-                        "Team": ev.repo_name,
-                        "Reported Completion %": ev.task_metrics.reported_completion_pct,
-                        "Evidence-Verified %": ev.task_metrics.verified_completion_pct or 0.0,
-                    }
-                )
-        if chart_rows:
-            cdf = pd.DataFrame(chart_rows).set_index("Team")
-            st.bar_chart(cdf)
-        else:
-            st.info("No structured task completion percentages reported yet across filtered teams.")
-
-    with chart_col2:
-        st.markdown("#### Task Status Distribution by Team")
-        status_rows = []
-        for ev in filtered_evals:
-            if ev.snapshot.accessible and ev.task_metrics.total_tasks > 0:
-                status_rows.append(
-                    {
-                        "Team": ev.repo_name,
-                        "Completed": ev.task_metrics.completed_tasks,
-                        "In Progress": ev.task_metrics.in_progress_tasks,
-                        "Blocked": ev.task_metrics.blocked_tasks,
-                        "Not Started": ev.task_metrics.not_started_tasks,
-                    }
-                )
-        if status_rows:
-            sdf = pd.DataFrame(status_rows).set_index("Team")
-            st.bar_chart(sdf)
-        else:
-            st.info("No structured `tasks/tasks.json` records available to chart.")
-
-    # ------------------------------------------------------------------
-    # Actionable Alerts Feed
-    # ------------------------------------------------------------------
-    st.markdown("#### Cohort Alerts: Missing Deliverables, Overdue Work & Validation Warnings")
     all_alerts: List[AlertItem] = []
     for ev in filtered_evals:
         all_alerts.extend(ev.alerts)
 
-    if not all_alerts:
-        st.success("No active alerts across the selected teams.")
-    else:
-        sev_filter = st.radio(
-            "Filter alerts by severity",
-            options=["All", "Critical Only", "Warnings & Critical"],
-            horizontal=True,
+    # ------------------------------------------------------------------
+    # Organized Tabbed Workspace (No Cluttered Vertical Wall)
+    # ------------------------------------------------------------------
+    tab_cards, tab_matrix, tab_charts, tab_alerts = st.tabs(
+        [
+            f"🗂️ Team Cards ({len(filtered_evals)})",
+            "📊 Comparison Matrix",
+            "📈 Progress Charts",
+            f"🔔 Alerts & Warnings ({len(all_alerts)})",
+        ]
+    )
+
+    with tab_cards:
+        if not filtered_evals:
+            st.info("No teams match the current filter criteria.")
+        else:
+            card_cols = st.columns(3)
+            for idx, ev in enumerate(filtered_evals):
+                with card_cols[idx % 3]:
+                    with st.container(border=True):
+                        t_name = ev.metadata.team_name if ev.metadata else ev.repo_name
+                        st.markdown(f"**{t_name}** (`{ev.repo_name}`)")
+                        st.caption(
+                            f"{_attention_badge(ev.attention_level)} • "
+                            f"{ev.metadata.domain if ev.metadata else 'Domain Not Reported'}"
+                        )
+                        if ev.hybrid_progress_pct is not None:
+                            st.progress(
+                                min(1.0, max(0.0, ev.hybrid_progress_pct / 100.0)),
+                                text=f"Progress: {ev.hybrid_progress_pct:.1f}%",
+                            )
+                        else:
+                            st.progress(0.0, text=f"Progress: {ev.progress_display_status}")
+
+                        c_a, c_b = st.columns(2)
+                        c_a.caption(f"Review: **{ev.current_review_label}**")
+                        c_b.caption(
+                            f"Tasks: **{ev.task_metrics.completed_tasks}/{ev.task_metrics.total_tasks}** "
+                            f"({ev.task_metrics.overdue_tasks} overdue)"
+                        )
+
+                        b1, b2, b3 = st.columns(3)
+                        if b1.button("Workspace", key=f"nav_ws_{ev.repo_name}", use_container_width=True):
+                            st.session_state["selected_repo"] = ev.repo_name
+                            st.session_state["active_page"] = (
+                                "Individual Team Workspace"
+                                if "Individual Team Workspace" in st.session_state.get("_nav_options", [])
+                                else "Team 16 Workspace & Profile"
+                            )
+                            st.rerun()
+                        if b2.button("Files", key=f"nav_ex_{ev.repo_name}", use_container_width=True):
+                            st.session_state["selected_repo"] = ev.repo_name
+                            st.session_state["active_page"] = "Repository Explorer"
+                            st.rerun()
+                        b3.link_button("GitHub ↗", ev.snapshot.html_url, use_container_width=True)
+
+    with tab_matrix:
+        st.caption(
+            "Side-by-side comparison of reported progress, verified repository evidence, milestones, "
+            "and separate GitHub push dates."
         )
-        for alert in all_alerts:
-            if sev_filter == "Critical Only" and alert.severity != "critical":
-                continue
-            if sev_filter == "Warnings & Critical" and alert.severity not in ("critical", "warning"):
-                continue
-            prefix = f"**[{alert.repo_name} — {alert.category}]** {alert.message}"
-            if alert.severity == "critical":
-                st.error(prefix)
-            elif alert.severity == "warning":
-                st.warning(prefix)
+        if rows:
+            display_df = pd.DataFrame(rows).drop(
+                columns=["_sort_progress", "_sort_overdue", "_sort_attention"]
+            )
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "GitHub URL": st.column_config.LinkColumn("GitHub Repo", display_text="Open Repo ↗"),
+                },
+            )
+        else:
+            st.info("No teams match the current filter criteria.")
+
+    with tab_charts:
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.markdown("##### Reported vs. Evidence-Verified Task Completion (%)")
+            chart_rows = [
+                {
+                    "Team": ev.repo_name,
+                    "Reported Completion %": ev.task_metrics.reported_completion_pct,
+                    "Evidence-Verified %": ev.task_metrics.verified_completion_pct or 0.0,
+                }
+                for ev in filtered_evals
+                if ev.snapshot.accessible and ev.task_metrics.reported_completion_pct is not None
+            ]
+            if chart_rows:
+                st.bar_chart(pd.DataFrame(chart_rows).set_index("Team"))
             else:
-                st.info(prefix)
+                st.info("No structured task completion percentages reported yet.")
+
+        with chart_col2:
+            st.markdown("##### Task Status Breakdown by Team")
+            status_rows = [
+                {
+                    "Team": ev.repo_name,
+                    "Completed": ev.task_metrics.completed_tasks,
+                    "In Progress": ev.task_metrics.in_progress_tasks,
+                    "Blocked": ev.task_metrics.blocked_tasks,
+                    "Not Started": ev.task_metrics.not_started_tasks,
+                }
+                for ev in filtered_evals
+                if ev.snapshot.accessible and ev.task_metrics.total_tasks > 0
+            ]
+            if status_rows:
+                st.bar_chart(pd.DataFrame(status_rows).set_index("Team"))
+            else:
+                st.info("No structured `tasks/tasks.json` records available to chart.")
+
+    with tab_alerts:
+        if not all_alerts:
+            st.success("All clear! No active alerts across the selected teams.")
+        else:
+            sev_filter = st.radio(
+                "Filter alerts by severity",
+                options=["All", "Critical Only", "Warnings & Critical"],
+                horizontal=True,
+            )
+            for alert in all_alerts:
+                if sev_filter == "Critical Only" and alert.severity != "critical":
+                    continue
+                if sev_filter == "Warnings & Critical" and alert.severity not in ("critical", "warning"):
+                    continue
+                prefix = f"**[{alert.repo_name} • {alert.category}]** {alert.message}"
+                if alert.severity == "critical":
+                    st.error(prefix)
+                elif alert.severity == "warning":
+                    st.warning(prefix)
+                else:
+                    st.info(prefix)
