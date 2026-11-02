@@ -4,9 +4,9 @@ Security, authentication, role-based access control (RBAC), and content sanitiza
 Design principles:
 1. Never expose GitHub credentials, tokens, or secrets in UI components, URLs, or logs.
 2. Enforce server-side authorization checks before any repository or team data is accessed.
-3. Support the two Organization Owners (`owner` / `mentor` roles) with full access to all
-   six repositories (`pbl-team-13`..`pbl-team-18`), while supporting future `student` role
-   accounts strictly scoped to their single assigned repository.
+3. Support Organization Owners / Team Leads (`owner` role) with full read/write control over
+   their authorized repositories, while `student` role accounts are strictly read-only and
+   scoped to their assigned repository.
 4. Provide constant-time password verification (PBKDF2-HMAC-SHA256) and safe Markdown/HTML
    sanitization so untrusted repository files cannot execute XSS in the browser.
 """
@@ -31,9 +31,9 @@ from src.config import to_plain_dict
 class UserRole(str, Enum):
     """Supported application roles."""
 
-    OWNER = "owner"      # Organization owner / Lead Mentor (full access to all 6 repos + settings)
-    MENTOR = "mentor"    # Co-mentor / evaluator (access to configured repos, read + review feedback)
-    STUDENT = "student"  # Future student view (strictly restricted to their single team repo)
+    OWNER = "owner"      # Organization Owner / Team Lead (full read + GitHub JSON write access)
+    MENTOR = "mentor"    # Co-mentor / evaluator (read + review evaluation access)
+    STUDENT = "student"  # Student team member (strictly read-only access to assigned repository)
 
 
 @dataclass(frozen=True)
@@ -50,37 +50,37 @@ class AuthenticatedUser:
     def can_access_repo(self, repo_name: str) -> bool:
         """
         Server-side authorization check for whether this user can access `repo_name`.
-
-        - Organization owners can access all configured cohort repositories.
-        - Mentors can access all repositories listed in `allowed_repos` (or `*`).
-        - Students can ONLY access the exact repository explicitly assigned to them,
-          preventing URL parameter or selector tampering.
         """
         normalized = (repo_name or "").strip().lower()
         if not normalized:
             return False
-        if self.role == UserRole.OWNER:
-            if "*" in self.allowed_repos:
-                return True
-            return normalized in {r.lower() for r in self.allowed_repos}
-        if self.role == UserRole.MENTOR:
+        if self.role in (UserRole.OWNER, UserRole.MENTOR):
             if "*" in self.allowed_repos:
                 return True
             return normalized in {r.lower() for r in self.allowed_repos}
         if self.role == UserRole.STUDENT:
-            # Students are never permitted wildcard access
             explicit_allowed = {r.lower() for r in self.allowed_repos if r != "*"}
             return normalized in explicit_allowed
         return False
 
+    def can_edit_repo_metadata(self, repo_name: str) -> bool:
+        """
+        Only users configured with `role = "owner"` (Team Leads / Organization Owners)
+        for `repo_name` can create or edit structured JSON files in GitHub.
+        Students (`role = "student"`) are strictly read-only.
+        """
+        if self.role != UserRole.OWNER:
+            return False
+        return self.can_access_repo(repo_name)
+
     def can_write_feedback(self, repo_name: str) -> bool:
-        """Only Owners and Mentors authorized for the repository can record review feedback."""
+        """Only Owners and Mentors authorized for the repository can record review evaluations."""
         if self.role not in (UserRole.OWNER, UserRole.MENTOR):
             return False
         return self.can_access_repo(repo_name)
 
     def can_manage_settings(self) -> bool:
-        """Only Organization Owners can modify cohort-wide settings or trigger GitHub writeback."""
+        """Only Owners can manage settings or trigger GitHub write-back."""
         return self.role == UserRole.OWNER
 
 
@@ -135,13 +135,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 
 class AccessControlManager:
-    """
-    Manages user authentication and role-based repository authorization.
-
-    Loads user definitions from `.streamlit/secrets.toml` (`[auth.users]`) or
-    environment variables (`PBL_OWNER_1_USERNAME`, `PBL_OWNER_1_PASSWORD_HASH`, etc.).
-    Correctly handles Streamlit's nested `AttrDict` (`collections.abc.Mapping`) objects.
-    """
+    """Manages user authentication and role-based repository authorization."""
 
     def __init__(self, secrets_map: Optional[Mapping] = None, configured_repos: Optional[List[str]] = None):
         plain = to_plain_dict(secrets_map) if secrets_map is not None else {}
@@ -175,7 +169,6 @@ class AccessControlManager:
                 allowed_tuple = tuple(str(r).strip() for r in allowed if str(r).strip())
 
             pw_hash = str(udata.get("password_hash", "")).strip()
-            # Ignore unedited template placeholders so we can give a clear diagnostic if unedited
             if pw_hash.startswith("<") and pw_hash.endswith(">"):
                 pw_hash = ""
 
@@ -188,7 +181,6 @@ class AccessControlManager:
                 "email": udata.get("email"),
             }
 
-        # Support environment variable configuration for the two Organization Owners
         for idx in (1, 2):
             env_user = os.environ.get(f"PBL_OWNER_{idx}_USERNAME")
             env_hash = os.environ.get(f"PBL_OWNER_{idx}_PASSWORD_HASH")
@@ -239,10 +231,6 @@ class AccessControlManager:
         )
 
     def authorize_repo_access(self, user: Optional[AuthenticatedUser], repo_name: str) -> None:
-        """
-        Enforce server-side repository access control.
-        Raises `AuthorizationError` if `user` is unauthenticated or not permitted for `repo_name`.
-        """
         if user is None:
             raise AuthorizationError("Authentication required to access repository data.")
         if repo_name.lower() not in {r.lower() for r in self.configured_repos} and "*" not in user.allowed_repos:
@@ -253,15 +241,10 @@ class AccessControlManager:
             )
 
     def filter_authorized_repos(self, user: Optional[AuthenticatedUser], repos: List[str]) -> List[str]:
-        """Return only the subset of `repos` that `user` is authorized to view."""
         if user is None:
             return []
         return [r for r in repos if user.can_access_repo(r)]
 
-
-# ---------------------------------------------------------------------------
-# Content Sanitization & Redaction Utilities
-# ---------------------------------------------------------------------------
 
 _SCRIPT_TAG_RE = re.compile(r"<\s*(script|iframe|object|embed|form|style|meta|link|base)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
 _SELF_CLOSING_DANGEROUS_RE = re.compile(r"<\s*(script|iframe|object|embed|meta|link|base|input|button)\b[^>]*/?\s*>", re.IGNORECASE)
@@ -273,11 +256,6 @@ _TOKEN_REDACT_RE = re.compile(
 
 
 def sanitize_markdown_for_display(markdown_text: str) -> str:
-    """
-    Sanitize repository Markdown content before rendering in Streamlit.
-    Strips raw HTML script/iframe/object tags, inline `on*` event handlers,
-    and `javascript:` / `data:` URIs while keeping standard Markdown intact.
-    """
     if not markdown_text:
         return ""
     cleaned = _SCRIPT_TAG_RE.sub("[removed unsafe HTML block]", markdown_text)
@@ -288,7 +266,6 @@ def sanitize_markdown_for_display(markdown_text: str) -> str:
 
 
 def is_safe_external_url(url: Optional[str]) -> bool:
-    """Validate that a URL uses strictly `https://` or `http://` or is a relative repository path."""
     if not url or not isinstance(url, str):
         return False
     stripped = url.strip()
@@ -305,12 +282,10 @@ def is_safe_external_url(url: Optional[str]) -> bool:
 
 
 def redact_secrets(text: str) -> str:
-    """Redact any accidental GitHub tokens or Bearer credentials from error messages or logs."""
     if not text:
         return ""
     return _TOKEN_REDACT_RE.sub("[REDACTED_CREDENTIAL]", str(text))
 
 
 def escape_html_text(text: str) -> str:
-    """Escape untrusted plain text for safe display."""
     return html.escape(str(text or ""), quote=True)

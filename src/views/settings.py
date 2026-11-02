@@ -2,9 +2,9 @@
 Settings, GitHub Connection Diagnostics, Rate-Limit Monitor & Security Audit View.
 
 Organized into three clean tabs:
-1. `🔌 GitHub Connection & Cache`: Per-repo connectivity table, API rate-limit status, and manual cache refresh.
-2. `🔐 Security & Password Hasher`: Active user session info and PBKDF2-HMAC-SHA256 hash generator.
-3. `📜 SQLite Audit & Database Management`: Security audit trail and 1-click local SQLite reset options.
+1. `GitHub Connection & Cache`: Per-repo connectivity table, API rate-limit status, and manual cache refresh.
+2. `Security & Password Hasher`: Active user session info and PBKDF2-HMAC-SHA256 hash generator.
+3. `SQLite Audit & Database Management`: Security audit trail and 1-click local SQLite reset options.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ def render_settings_page(
     user: AuthenticatedUser,
     local_store: MentorLocalStore,
 ) -> None:
-    """Render the decluttered, tab-organized Settings & Diagnostics view."""
-    st.markdown("## ⚙️ Settings, GitHub Diagnostics & Security")
+    """Render the clean, tab-organized Settings & Diagnostics view."""
+    st.markdown("## Settings, GitHub Diagnostics & Security")
 
     rl = github_client.rate_limit
     r1, r2, r3, r4 = st.columns(4)
@@ -44,9 +44,9 @@ def render_settings_page(
 
     tab_gh, tab_sec, tab_db = st.tabs(
         [
-            "🔌 GitHub Connection & Cache",
-            "🔐 Security & Password Hasher",
-            "📜 SQLite Audit Log & Reset",
+            "GitHub Connection & Cache",
+            "Security & Password Hasher",
+            "SQLite Audit Log & Reset",
         ]
     )
 
@@ -61,7 +61,7 @@ def render_settings_page(
                 {
                     "Organization": snap.org,
                     "Repository": repo_name,
-                    "Status": "✅ Connected" if snap.accessible else "❌ Unreachable",
+                    "Status": "Connected" if snap.accessible else "Unreachable",
                     "HTTP": snap.status_code,
                     "Visibility": "Private" if snap.private else "Public",
                     "Default Branch": snap.default_branch if snap.accessible else "-",
@@ -74,7 +74,7 @@ def render_settings_page(
         st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
 
         c_btn1, c_btn2 = st.columns(2)
-        if c_btn1.button("🔄 Clear API Cache & Refresh All Repositories", use_container_width=True):
+        if c_btn1.button("Clear API Cache & Refresh All Repositories", use_container_width=True):
             github_client.clear_cache()
             local_store.log_audit_event(
                 username=user.username,
@@ -110,7 +110,7 @@ def render_settings_page(
 
         if user.can_manage_settings():
             st.divider()
-            st.markdown("#### 🔐 PBKDF2-HMAC-SHA256 Password Hash Generator")
+            st.markdown("#### PBKDF2-HMAC-SHA256 Password Hash Generator")
             st.caption(
                 "Generate a salted PBKDF2-HMAC-SHA256 hash for any new mentor or student account "
                 "to paste into `.streamlit/secrets.toml` (or Streamlit Cloud Secrets)."
@@ -132,7 +132,7 @@ def render_settings_page(
             st.warning(f"Local SQLite database unavailable: {local_store.last_error}")
         else:
             if user.can_manage_settings():
-                with st.expander("🗑️ Reset / Clear Local SQLite Database Tables", expanded=False):
+                with st.expander("Reset / Clear Local SQLite Database Tables", expanded=False):
                     st.caption(
                         "Clearing local SQLite tables only resets local drafts or audit logs—it never deletes "
                         "any files in your GitHub repositories."

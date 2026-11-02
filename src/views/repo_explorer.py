@@ -37,10 +37,6 @@ from src.security import (
 def _list_directory_from_tree(
     tree_entries: List[RepoFileEntry], current_dir: str
 ) -> List[RepoFileEntry]:
-    """
-    Derive the immediate children of `current_dir` from the repository's recursive tree,
-    supporting arbitrary custom folder hierarchies without extra API round-trips.
-    """
     clean_dir = current_dir.strip("/")
     prefix = f"{clean_dir}/" if clean_dir else ""
     children_map: Dict[str, RepoFileEntry] = {}
@@ -54,7 +50,6 @@ def _list_directory_from_tree(
         if "/" not in rel:
             children_map[entry.path] = entry
         else:
-            # Synthesize directory entry if only leaf blobs were present
             top_seg = rel.split("/", 1)[0]
             dir_path = f"{prefix}{top_seg}"
             if dir_path not in children_map:
@@ -77,8 +72,8 @@ def render_repo_explorer_page(
     user: AuthenticatedUser,
     access_manager: AccessControlManager,
 ) -> None:
-    """Render the interactive GitHub Repository Explorer."""
-    st.subheader("Repository Explorer")
+    """Render the clean, emoji-free GitHub Repository Explorer."""
+    st.markdown("## Repository Explorer")
     st.caption(
         "Browse live repository directories, custom folders, and files directly from GitHub. "
         "GitHub remains the single source of truth."
@@ -112,7 +107,7 @@ def render_repo_explorer_page(
 
     with col_gh:
         st.write("")
-        st.link_button("Open Repo on GitHub ↗", snap.html_url, use_container_width=True)
+        st.link_button("Open Repo on GitHub", snap.html_url, use_container_width=True)
 
     if not snap.accessible:
         st.error(f"Cannot browse `{selected_repo}`: {snap.error_message}")
@@ -127,12 +122,9 @@ def render_repo_explorer_page(
 
     current_path: str = st.session_state.get("explorer_path", "").strip("/")
 
-    # ------------------------------------------------------------------
-    # Breadcrumb Navigation Bar
-    # ------------------------------------------------------------------
     segments = [seg for seg in current_path.split("/") if seg]
     bc_cols = st.columns(min(8, len(segments) + 2))
-    if bc_cols[0].button(f"🏠 {selected_repo}", key="bc_root", use_container_width=True):
+    if bc_cols[0].button(f"Root: {selected_repo}", key="bc_root", use_container_width=True):
         st.session_state["explorer_path"] = ""
         st.session_state["explorer_selected_file"] = None
         st.rerun()
@@ -142,12 +134,11 @@ def render_repo_explorer_page(
         accum.append(seg)
         target_path = "/".join(accum)
         col_idx = min(idx + 1, len(bc_cols) - 1)
-        if bc_cols[col_idx].button(f"📁 {seg}", key=f"bc_{target_path}", use_container_width=True):
+        if bc_cols[col_idx].button(f"{seg}/", key=f"bc_{target_path}", use_container_width=True):
             st.session_state["explorer_path"] = target_path
             st.session_state["explorer_selected_file"] = None
             st.rerun()
 
-    # Retrieve directory entries (from recursive tree or fallback to live Contents API)
     if snap.tree_entries and not snap.tree_truncated:
         dir_entries = _list_directory_from_tree(snap.tree_entries, current_path)
         dir_error = None
@@ -162,14 +153,11 @@ def render_repo_explorer_page(
 
     left_pane, right_pane = st.columns([1.15, 1.85])
 
-    # ------------------------------------------------------------------
-    # Left Pane: Folder & File Navigator
-    # ------------------------------------------------------------------
     with left_pane:
         st.markdown(f"#### Directory: `/{current_path}`")
         if current_path:
             parent_path = "/".join(segments[:-1])
-            if st.button("⬅️ Up to parent folder", key="btn_up_dir"):
+            if st.button("Up to parent folder", key="btn_up_dir"):
                 st.session_state["explorer_path"] = parent_path
                 st.session_state["explorer_selected_file"] = None
                 st.rerun()
@@ -181,7 +169,7 @@ def render_repo_explorer_page(
             ]
             st.caption(f"Global search matches ({len(matched_files)}):")
             for entry in matched_files[:40]:
-                if st.button(f"📄 {entry.path} ({entry.size:,} B)", key=f"gsearch_{entry.path}", use_container_width=True):
+                if st.button(f"{entry.path} ({entry.size:,} B)", key=f"gsearch_{entry.path}", use_container_width=True):
                     st.session_state["explorer_selected_file"] = entry.path
                     st.rerun()
         else:
@@ -192,14 +180,14 @@ def render_repo_explorer_page(
                 st.info("This directory is empty.")
 
             for d in dirs:
-                if st.button(f"📁 {d.name}/", key=f"dir_{d.path}", use_container_width=True):
+                if st.button(f"[Folder] {d.name}/", key=f"dir_{d.path}", use_container_width=True):
                     st.session_state["explorer_path"] = d.path
                     st.session_state["explorer_selected_file"] = None
                     st.rerun()
 
             for f in files:
                 if st.button(
-                    f"📄 {f.name} ({f.size:,} B)",
+                    f"{f.name} ({f.size:,} B)",
                     key=f"file_{f.path}",
                     use_container_width=True,
                 ):
@@ -222,9 +210,6 @@ def render_repo_explorer_page(
                 )
                 st.dataframe(meta_df, use_container_width=True, hide_index=True)
 
-    # ------------------------------------------------------------------
-    # Right Pane: Safe File Content Previewer
-    # ------------------------------------------------------------------
     with right_pane:
         selected_file_path = st.session_state.get("explorer_selected_file")
         if not selected_file_path:
@@ -244,7 +229,7 @@ def render_repo_explorer_page(
         m2.caption(f"**SHA:** `{file_res.sha[:10] if file_res.sha else 'N/A'}`")
         ext = ("." + selected_file_path.rsplit(".", 1)[-1].lower()) if "." in selected_file_path else ""
         m3.caption(f"**Format:** `{ext or 'plain'}`")
-        m4.link_button("Open File on GitHub ↗", file_res.html_url, use_container_width=True)
+        m4.link_button("Open File on GitHub", file_res.html_url, use_container_width=True)
 
         if not file_res.exists:
             st.error(file_res.error_message or "File could not be retrieved.")
@@ -259,14 +244,13 @@ def render_repo_explorer_page(
 
         if file_res.raw_bytes is not None:
             st.download_button(
-                label=f"⬇️ Download `{selected_file_path.rsplit('/', 1)[-1]}` ({file_res.size:,} bytes)",
+                label=f"Download {selected_file_path.rsplit('/', 1)[-1]} ({file_res.size:,} bytes)",
                 data=file_res.raw_bytes,
                 file_name=selected_file_path.rsplit("/", 1)[-1],
                 mime="application/octet-stream",
                 key=f"dl_{selected_repo}_{selected_file_path}",
             )
 
-        # Render according to file extension and content safety rules
         if ext in PREVIEWABLE_IMAGE_EXTENSIONS and file_res.raw_bytes:
             st.image(file_res.raw_bytes, caption=selected_file_path, use_container_width=True)
             return

@@ -1,9 +1,9 @@
 """
-Central configuration for the PBL Team 16 Dedicated Dashboard (`pbl-team-16`).
+Central configuration and repository registry for the PBL Cohort-X Dashboard.
 
-Configured specifically for `PBL-Cohort-X-Teams-13-18/pbl-team-16` with two-way
-GitHub JSON synchronization so updates made in the Team 16 Dashboard are immediately
-reflected in both the Team 16 Dashboard and the 6-Team Mentor Dashboard.
+Defines the organization structure (`PBL-Cohort-X-Teams-13-18`), default private team
+repositories (`pbl-team-13` through `pbl-team-18`), recommended metadata paths,
+review stages, and configurable thresholds.
 """
 
 from __future__ import annotations
@@ -16,8 +16,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_GITHUB_ORG: str = "PBL-Cohort-X-Teams-13-18"
 
-DEFAULT_TEAM_REPOS: Tuple[str, ...] = ("pbl-team-16",)
+DEFAULT_TEAM_REPOS: Tuple[str, ...] = (
+    "pbl-team-16",
+)
 
+# Standard optional metadata file paths inside each team repository
 CONVENTION_FILES: Dict[str, str] = {
     "readme": "README.md",
     "metadata": "project/metadata.json",
@@ -32,6 +35,7 @@ CONVENTION_FILES: Dict[str, str] = {
     "review_4": "reviews/review-4.json",
 }
 
+# Standard recommended folders for categorizing repository artifacts dynamically
 RECOMMENDED_CATEGORY_FOLDERS: Dict[str, Tuple[str, ...]] = {
     "Research & Literature": ("research", "literature", "papers", "references"),
     "Technical Documentation": ("documentation", "docs", "architecture", "specs", "design"),
@@ -42,6 +46,7 @@ RECOMMENDED_CATEGORY_FOLDERS: Dict[str, Tuple[str, ...]] = {
     "Project Management": ("project", "team", "tasks", "reviews"),
 }
 
+# Supported previewable file extensions
 PREVIEWABLE_TEXT_EXTENSIONS: Tuple[str, ...] = (
     ".md",
     ".markdown",
@@ -79,6 +84,7 @@ PREVIEWABLE_IMAGE_EXTENSIONS: Tuple[str, ...] = (
 
 PREVIEWABLE_PDF_EXTENSIONS: Tuple[str, ...] = (".pdf",)
 
+# Maximum file size (in bytes) for in-app content retrieval via GitHub Contents API (1 MB)
 MAX_PREVIEW_FILE_BYTES: int = 1_000_000
 
 
@@ -161,22 +167,23 @@ DEFAULT_REVIEWS: Tuple[ReviewDefinition, ...] = (
 
 @dataclass
 class DashboardConfig:
-    """Runtime configuration for the Team 16 Dashboard."""
+    """Runtime configuration loaded from Streamlit secrets or environment variables."""
 
     github_org: str = DEFAULT_GITHUB_ORG
     team_repos: List[str] = field(default_factory=lambda: list(DEFAULT_TEAM_REPOS))
     github_api_base_url: str = "https://api.github.com"
     api_timeout_seconds: int = 15
     max_retries: int = 3
-    cache_ttl_seconds: int = 120
+    cache_ttl_seconds: int = 300
     stale_progress_days: int = 10
     stale_repo_commit_days: int = 14
-    sqlite_db_path: str = "data/team16_dashboard.db"
+    sqlite_db_path: str = "data/mentor_dashboard.db"
     enable_github_writeback: bool = True
     reviews: List[ReviewDefinition] = field(default_factory=lambda: list(DEFAULT_REVIEWS))
 
     @classmethod
     def from_mapping(cls, secrets_map: Optional[Mapping] = None) -> "DashboardConfig":
+        """Build a DashboardConfig from a secrets mapping (including Streamlit AttrDict) and environment variables."""
         plain = to_plain_dict(secrets_map) if secrets_map is not None else {}
         if not isinstance(plain, dict):
             plain = {}
@@ -211,7 +218,7 @@ class DashboardConfig:
         )
         cache_ttl = int(
             app_section.get("cache_ttl_seconds")
-            or os.environ.get("PBL_CACHE_TTL_SECONDS", 120)
+            or os.environ.get("PBL_CACHE_TTL_SECONDS", 300)
         )
         stale_progress_days = int(
             app_section.get("stale_progress_days")
@@ -224,7 +231,7 @@ class DashboardConfig:
         db_path = (
             app_section.get("sqlite_db_path")
             or os.environ.get("PBL_SQLITE_DB_PATH")
-            or "data/team16_dashboard.db"
+            or "data/mentor_dashboard.db"
         )
         writeback_raw = app_section.get(
             "enable_github_writeback",

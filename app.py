@@ -135,7 +135,7 @@ def _render_login_screen(
     config: DashboardConfig,
     team_label: str,
 ) -> None:
-    st.markdown(f"## 🔒 PBL {team_label} Dashboard — Sign In")
+    st.markdown(f"## PBL {team_label} Dashboard — Sign In")
     st.caption(
         f"Organization: `{config.github_org}` | Configured Repositories: `{', '.join(config.team_repos)}`"
     )
@@ -146,7 +146,7 @@ def _render_login_screen(
             "**Dashboard Authentication Not Configured:** No valid user credentials found in "
             f"`{app_dir / '.streamlit' / 'secrets.toml'}` (or Streamlit Cloud Secrets)."
         )
-        if st.button("🔄 Reload Secrets"):
+        if st.button("Reload Secrets"):
             st.session_state.clear()
             st.rerun()
         return
@@ -211,7 +211,6 @@ def main() -> None:
 
     st.set_page_config(
         page_title=f"PBL {team_label} Dashboard",
-        page_icon="🚀" if is_single_team else "🧭",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -223,9 +222,10 @@ def main() -> None:
         return
 
     with st.sidebar:
-        st.markdown(f"### {'🚀' if is_single_team else '🧭'} PBL {team_label}")
+        st.markdown(f"### PBL {team_label}")
         st.caption(f"Repo: `{config.github_org}/{', '.join(config.team_repos)}`")
-        st.markdown(f"👤 **{user.display_name}** (`{user.role.value}`)")
+        access_badge = "Write Access (Owner)" if user.role.value == "owner" else "Read-Only"
+        st.markdown(f"**{user.display_name}** (`{user.role.value}` — {access_badge})")
 
         if "active_page" not in st.session_state or st.session_state["active_page"] not in nav_pages:
             st.session_state["active_page"] = nav_pages[0]
@@ -251,10 +251,10 @@ def main() -> None:
             )
 
         c_ref, c_out = st.columns(2)
-        if c_ref.button("🔄 Sync Now", use_container_width=True):
+        if c_ref.button("Sync Now", use_container_width=True):
             github_client.clear_cache()
             st.rerun()
-        if c_out.button("🚪 Sign Out", use_container_width=True):
+        if c_out.button("Sign Out", use_container_width=True):
             local_store.log_audit_event(
                 username=user.username,
                 role=user.role.value,
@@ -269,7 +269,9 @@ def main() -> None:
 
     active_page = st.session_state["active_page"]
     if active_page in ("Team Workspace & Profile", "Team 16 Workspace & Profile", "Individual Team Workspace"):
-        render_team_workspace_page(evaluations, user, access_manager)
+        render_team_workspace_page(
+            evaluations, user, access_manager, github_client=github_client, local_store=local_store
+        )
     elif active_page in ("Tasks, Progress & Live GitHub Sync", "Progress & Tasks"):
         render_tasks_progress_page(
             evaluations, user, access_manager, local_store, github_client=github_client, config=config
@@ -279,7 +281,9 @@ def main() -> None:
     elif active_page in ("Reviews & Mentor Feedback", "Reviews & Feedback"):
         render_reviews_page(evaluations, config, github_client, user, access_manager, local_store)
     elif active_page in ("Timeline & Milestones",):
-        render_timeline_page(evaluations, user, access_manager)
+        render_timeline_page(
+            evaluations, user, access_manager, github_client=github_client, local_store=local_store
+        )
     elif active_page in ("Research & Competitions",):
         render_research_competitions_page(evaluations, user, access_manager)
     elif active_page in ("Overview & Alerts", "Overview & Cohort Comparison"):

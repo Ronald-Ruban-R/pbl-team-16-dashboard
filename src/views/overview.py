@@ -1,9 +1,9 @@
 """
 Overall Mentor Dashboard & All-Teams Cohort Comparison View.
 
-Organized into clean, uncluttered tabs so the mentor sees high-level KPIs immediately
-and can switch smoothly between Team Cards, the Comparison Matrix, Visual Charts, and
-Cohort Alerts without endless vertical scrolling.
+Organized into clean, emoji-free tabs so the mentor or team lead sees high-level KPIs
+immediately and can switch smoothly between Team Cards, Comparison Matrix, Progress Charts,
+and Alerts without visual clutter.
 """
 
 from __future__ import annotations
@@ -17,24 +17,14 @@ from src.analytics import AlertItem, TeamEvaluationSummary
 from src.config import DashboardConfig
 
 
-def _attention_badge(level: str) -> str:
-    mapping = {
-        "On Track": "🟢 On Track",
-        "Needs Attention": "🟡 Needs Attention",
-        "Critical / Blocked": "🔴 Critical / Blocked",
-        "Unavailable": "⚫ Unavailable",
-    }
-    return mapping.get(level, level)
-
-
 def render_overview_page(
     evaluations: Dict[str, TeamEvaluationSummary],
     config: DashboardConfig,
 ) -> None:
-    """Render the decluttered Overall Cohort Mentor Dashboard."""
-    st.markdown("## 🧭 Cohort Executive Overview")
+    """Render the clean, emoji-free Executive Overview."""
+    st.markdown("## Executive Overview")
     st.caption(
-        f"Organization: `{config.github_org}` • Project completion is calculated strictly from "
+        f"Organization: `{config.github_org}` | Project completion is calculated strictly from "
         "reported tasks and milestones (kept separate from GitHub commit activity)."
     )
 
@@ -55,10 +45,7 @@ def render_overview_page(
     col5.metric("Overdue Tasks", total_overdue_tasks)
     col6.metric("Open Action Items", total_unresolved_ais)
 
-    # ------------------------------------------------------------------
-    # Collapsible Filter & Sort Bar (keeps the main view clean)
-    # ------------------------------------------------------------------
-    with st.expander("🔍 Search, Filter & Sort Teams", expanded=False):
+    with st.expander("Search, Filter & Sort Teams", expanded=False):
         f_col1, f_col2, f_col3 = st.columns([2, 1.5, 1.5])
         with f_col1:
             search_query = st.text_input(
@@ -78,8 +65,8 @@ def render_overview_page(
                 options=[
                     "Repository Name",
                     "Attention Priority",
-                    "Reported Progress (High → Low)",
-                    "Overdue Tasks (High → Low)",
+                    "Reported Progress (High to Low)",
+                    "Overdue Tasks (High to Low)",
                 ],
             )
 
@@ -112,7 +99,7 @@ def render_overview_page(
                 "Team Name": team_name,
                 "Domain": domain,
                 "Project Title": title,
-                "Attention Status": _attention_badge(ev.attention_level),
+                "Attention Status": ev.attention_level,
                 "Progress Status": ev.progress_display_status,
                 "Reported Task %": (
                     f"{ev.task_metrics.reported_completion_pct:.1f}%"
@@ -149,9 +136,9 @@ def render_overview_page(
 
     if sort_by == "Attention Priority":
         rows.sort(key=lambda r: (r["_sort_attention"], r["Repository"]))
-    elif sort_by == "Reported Progress (High → Low)":
+    elif sort_by == "Reported Progress (High to Low)":
         rows.sort(key=lambda r: r["_sort_progress"], reverse=True)
-    elif sort_by == "Overdue Tasks (High → Low)":
+    elif sort_by == "Overdue Tasks (High to Low)":
         rows.sort(key=lambda r: r["_sort_overdue"], reverse=True)
     else:
         rows.sort(key=lambda r: r["Repository"])
@@ -160,15 +147,12 @@ def render_overview_page(
     for ev in filtered_evals:
         all_alerts.extend(ev.alerts)
 
-    # ------------------------------------------------------------------
-    # Organized Tabbed Workspace (No Cluttered Vertical Wall)
-    # ------------------------------------------------------------------
     tab_cards, tab_matrix, tab_charts, tab_alerts = st.tabs(
         [
-            f"🗂️ Team Cards ({len(filtered_evals)})",
-            "📊 Comparison Matrix",
-            "📈 Progress Charts",
-            f"🔔 Alerts & Warnings ({len(all_alerts)})",
+            f"Team Cards ({len(filtered_evals)})",
+            "Comparison Matrix",
+            "Progress Charts",
+            f"Alerts & Warnings ({len(all_alerts)})",
         ]
     )
 
@@ -183,7 +167,7 @@ def render_overview_page(
                         t_name = ev.metadata.team_name if ev.metadata else ev.repo_name
                         st.markdown(f"**{t_name}** (`{ev.repo_name}`)")
                         st.caption(
-                            f"{_attention_badge(ev.attention_level)} • "
+                            f"Status: **{ev.attention_level}** | "
                             f"{ev.metadata.domain if ev.metadata else 'Domain Not Reported'}"
                         )
                         if ev.hybrid_progress_pct is not None:
@@ -204,17 +188,18 @@ def render_overview_page(
                         b1, b2, b3 = st.columns(3)
                         if b1.button("Workspace", key=f"nav_ws_{ev.repo_name}", use_container_width=True):
                             st.session_state["selected_repo"] = ev.repo_name
+                            nav_opts = st.session_state.get("_nav_options", [])
                             st.session_state["active_page"] = (
                                 "Individual Team Workspace"
-                                if "Individual Team Workspace" in st.session_state.get("_nav_options", [])
-                                else "Team 16 Workspace & Profile"
+                                if "Individual Team Workspace" in nav_opts
+                                else "Team Workspace & Profile"
                             )
                             st.rerun()
                         if b2.button("Files", key=f"nav_ex_{ev.repo_name}", use_container_width=True):
                             st.session_state["selected_repo"] = ev.repo_name
                             st.session_state["active_page"] = "Repository Explorer"
                             st.rerun()
-                        b3.link_button("GitHub ↗", ev.snapshot.html_url, use_container_width=True)
+                        b3.link_button("GitHub", ev.snapshot.html_url, use_container_width=True)
 
     with tab_matrix:
         st.caption(
@@ -230,7 +215,7 @@ def render_overview_page(
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "GitHub URL": st.column_config.LinkColumn("GitHub Repo", display_text="Open Repo ↗"),
+                    "GitHub URL": st.column_config.LinkColumn("GitHub Repo", display_text="Open Repo"),
                 },
             )
         else:
@@ -274,7 +259,7 @@ def render_overview_page(
 
     with tab_alerts:
         if not all_alerts:
-            st.success("All clear! No active alerts across the selected teams.")
+            st.success("No active alerts across the selected teams.")
         else:
             sev_filter = st.radio(
                 "Filter alerts by severity",
@@ -286,7 +271,7 @@ def render_overview_page(
                     continue
                 if sev_filter == "Warnings & Critical" and alert.severity not in ("critical", "warning"):
                     continue
-                prefix = f"**[{alert.repo_name} • {alert.category}]** {alert.message}"
+                prefix = f"**[{alert.repo_name} | {alert.category}]** {alert.message}"
                 if alert.severity == "critical":
                     st.error(prefix)
                 elif alert.severity == "warning":
