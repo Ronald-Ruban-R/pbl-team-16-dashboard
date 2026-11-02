@@ -1,10 +1,13 @@
 """
-Main entry point for the PBL Team 16 Dedicated Workspace & Control Dashboard (`app.py`).
+Universal PBL Dashboard entry point (`app.py`).
 
-Run locally with:
-    streamlit run app.py --server.port 8502
-or by double-clicking:
-    run_team16_dashboard.bat
+Dynamically adapts to:
+1. Single-Team Dashboard (e.g., `repositories = ["pbl-team-13"]` or `["pbl-team-16"]`)
+2. Cohort-Wide Mentor Dashboard (e.g., `repositories = ["pbl-team-13", ... "pbl-team-18"]`)
+
+Derives all titles, headers, and navigation options dynamically from the configured
+repositories in `.streamlit/secrets.toml` with zero code modifications needed when deploying
+multiple instances from the same repository.
 """
 
 from __future__ import annotations
@@ -30,16 +33,29 @@ from src.views.team_workspace import render_team_workspace_page
 from src.views.timeline import render_timeline_page
 
 
-NAVIGATION_PAGES = (
-    "Team 16 Workspace & Profile",
-    "Tasks, Progress & Live GitHub Sync",
-    "Repository Explorer",
-    "Reviews & Mentor Feedback",
-    "Timeline & Milestones",
-    "Research & Competitions",
-    "Overview & Alerts",
-    "Settings & Diagnostics",
-)
+def _get_navigation_pages(is_single_team: bool) -> List[str]:
+    """Return appropriate navigation options based on whether this is a single team or cohort app."""
+    if is_single_team:
+        return [
+            "Team Workspace & Profile",
+            "Tasks, Progress & Live GitHub Sync",
+            "Repository Explorer",
+            "Reviews & Mentor Feedback",
+            "Timeline & Milestones",
+            "Research & Competitions",
+            "Overview & Alerts",
+            "Settings & Diagnostics",
+        ]
+    return [
+        "Overview & Cohort Comparison",
+        "Individual Team Workspace",
+        "Repository Explorer",
+        "Progress & Tasks",
+        "Reviews & Feedback",
+        "Timeline & Milestones",
+        "Research & Competitions",
+        "Settings & Diagnostics",
+    ]
 
 
 def _parse_toml_file(path: Path) -> Dict[str, Any]:
@@ -117,27 +133,28 @@ def _render_login_screen(
     access_manager: AccessControlManager,
     local_store: MentorLocalStore,
     config: DashboardConfig,
+    team_label: str,
 ) -> None:
-    st.markdown("## 🔒 PBL Team 16 Dashboard (`pbl-team-16`) — Sign In")
+    st.markdown(f"## 🔒 PBL {team_label} Dashboard — Sign In")
     st.caption(
-        f"Organization: `{config.github_org}` | Team Repository: `{', '.join(config.team_repos)}`"
+        f"Organization: `{config.github_org}` | Configured Repositories: `{', '.join(config.team_repos)}`"
     )
 
     if not access_manager.is_auth_configured():
         app_dir = Path(__file__).resolve().parent
         st.error(
-            "**Team 16 Dashboard Authentication Not Configured:** Copy `.streamlit/secrets.toml.example` "
-            f"to `{app_dir / '.streamlit' / 'secrets.toml'}` and paste your Team 16 GitHub token."
+            "**Dashboard Authentication Not Configured:** No valid user credentials found in "
+            f"`{app_dir / '.streamlit' / 'secrets.toml'}` (or Streamlit Cloud Secrets)."
         )
-        if st.button("🔄 Reload `.streamlit/secrets.toml`"):
+        if st.button("🔄 Reload Secrets"):
             st.session_state.clear()
             st.rerun()
         return
 
     col_left, col_center, col_right = st.columns([1, 1.4, 1])
     with col_center:
-        with st.form("team16_login_form", clear_on_submit=False):
-            st.markdown("#### Team 16 Lead / Member Sign In")
+        with st.form("universal_login_form", clear_on_submit=False):
+            st.markdown(f"#### {team_label} Sign In")
             username = st.text_input("Username", placeholder="RONALDRUBAN")
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign In", use_container_width=True)
@@ -184,35 +201,40 @@ def _load_authorized_team_evaluations(
 
 
 def main() -> None:
+    secrets_map = _load_streamlit_secrets()
+    config, access_manager, github_client, local_store = _get_or_init_services(secrets_map)
+
+    is_single_team = len(config.team_repos) == 1
+    team_label = config.team_repos[0].upper() if is_single_team else "Cohort-X"
+    nav_pages = _get_navigation_pages(is_single_team)
+    st.session_state["_nav_options"] = nav_pages
+
     st.set_page_config(
-        page_title="PBL Team 16 Dashboard",
-        page_icon="🚀",
+        page_title=f"PBL {team_label} Dashboard",
+        page_icon="🚀" if is_single_team else "🧭",
         layout="wide",
         initial_sidebar_state="expanded",
     )
     apply_clean_theme()
-    st.session_state["_nav_options"] = list(NAVIGATION_PAGES)
-
-    secrets_map = _load_streamlit_secrets()
-    config, access_manager, github_client, local_store = _get_or_init_services(secrets_map)
 
     user: AuthenticatedUser | None = st.session_state.get("authenticated_user")
     if user is None:
-        _render_login_screen(access_manager, local_store, config)
+        _render_login_screen(access_manager, local_store, config, team_label)
         return
 
     with st.sidebar:
-        st.markdown("### 🚀 PBL Team 16 Hub")
-        st.caption(f"Repo: `{config.github_org}/pbl-team-16`")
+        st.markdown(f"### {'🚀' if is_single_team else '🧭'} PBL {team_label}")
+        st.caption(f"Repo: `{config.github_org}/{', '.join(config.team_repos)}`")
         st.markdown(f"👤 **{user.display_name}** (`{user.role.value}`)")
 
-        if "active_page" not in st.session_state or st.session_state["active_page"] not in NAVIGATION_PAGES:
-            st.session_state["active_page"] = NAVIGATION_PAGES[0]
+        if "active_page" not in st.session_state or st.session_state["active_page"] not in nav_pages:
+            st.session_state["active_page"] = nav_pages[0]
 
         selected_page = st.radio(
             "Navigation",
-            options=list(NAVIGATION_PAGES),
-            index=list(NAVIGATION_PAGES).index(st.session_state["active_page"]),
+            options=nav_pages,
+            index=nav_pages.index(st.session_state["active_page"]),
+            label_visibility="collapsed",
         )
         if selected_page != st.session_state["active_page"]:
             st.session_state["active_page"] = selected_page
@@ -220,12 +242,12 @@ def main() -> None:
 
         st.divider()
         if not github_client.auth.is_configured:
-            st.warning("Add your Team 16 GitHub PAT to `.streamlit/secrets.toml`.")
+            st.warning("Configure GitHub token in `.streamlit/secrets.toml`.")
         else:
             rl = github_client.rate_limit
             st.caption(
                 f"GitHub Auth: `{github_client.auth.auth_mode}`\n\n"
-                f"API Quota Remaining: **{rl.remaining}/{rl.limit}**"
+                f"API Quota: **{rl.remaining:,}/{rl.limit:,}**"
             )
 
         c_ref, c_out = st.columns(2)
@@ -233,28 +255,34 @@ def main() -> None:
             github_client.clear_cache()
             st.rerun()
         if c_out.button("🚪 Sign Out", use_container_width=True):
+            local_store.log_audit_event(
+                username=user.username,
+                role=user.role.value,
+                action="logout",
+                details="User signed out.",
+            )
             st.session_state.pop("authenticated_user", None)
             st.rerun()
 
-    with st.spinner("Synchronizing `pbl-team-16` from GitHub..."):
+    with st.spinner(f"Synchronizing `{', '.join(config.team_repos)}` from GitHub..."):
         evaluations = _load_authorized_team_evaluations(user, config, github_client, local_store)
 
     active_page = st.session_state["active_page"]
-    if active_page == "Team 16 Workspace & Profile":
+    if active_page in ("Team Workspace & Profile", "Team 16 Workspace & Profile", "Individual Team Workspace"):
         render_team_workspace_page(evaluations, user, access_manager)
-    elif active_page == "Tasks, Progress & Live GitHub Sync":
+    elif active_page in ("Tasks, Progress & Live GitHub Sync", "Progress & Tasks"):
         render_tasks_progress_page(
             evaluations, user, access_manager, local_store, github_client=github_client, config=config
         )
     elif active_page == "Repository Explorer":
         render_repo_explorer_page(evaluations, github_client, user, access_manager)
-    elif active_page == "Reviews & Mentor Feedback":
+    elif active_page in ("Reviews & Mentor Feedback", "Reviews & Feedback"):
         render_reviews_page(evaluations, config, github_client, user, access_manager, local_store)
-    elif active_page == "Timeline & Milestones":
+    elif active_page in ("Timeline & Milestones",):
         render_timeline_page(evaluations, user, access_manager)
-    elif active_page == "Research & Competitions":
+    elif active_page in ("Research & Competitions",):
         render_research_competitions_page(evaluations, user, access_manager)
-    elif active_page == "Overview & Alerts":
+    elif active_page in ("Overview & Alerts", "Overview & Cohort Comparison"):
         render_overview_page(evaluations, config)
     elif active_page == "Settings & Diagnostics":
         render_settings_page(evaluations, config, github_client, user, local_store)
