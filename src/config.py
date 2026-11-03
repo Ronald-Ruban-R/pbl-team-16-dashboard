@@ -17,12 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_GITHUB_ORG: str = "PBL-Cohort-X-Teams-13-18"
 
 DEFAULT_TEAM_REPOS: Tuple[str, ...] = (
-    "pbl-team-13",
-    "pbl-team-14",
-    "pbl-team-15",
     "pbl-team-16",
-    "pbl-team-17",
-    "pbl-team-18",
 )
 
 # Standard optional metadata file paths inside each team repository
