@@ -1,291 +1,225 @@
 """
-Security, authentication, role-based access control (RBAC), and content sanitization.
+Security, Authentication, Role-Based Access Control (RBAC), and Sanitization Module.
 
-Design principles:
-1. Never expose GitHub credentials, tokens, or secrets in UI components, URLs, or logs.
-2. Enforce server-side authorization checks before any repository or team data is accessed.
-3. Support Organization Owners / Team Leads (`owner` role) with full read/write control over
-   their authorized repositories, while `student` role accounts are strictly read-only and
-   scoped to their assigned repository.
-4. Provide constant-time password verification (PBKDF2-HMAC-SHA256) and safe Markdown/HTML
-   sanitization so untrusted repository files cannot execute XSS in the browser.
+Enforces:
+- Salted PBKDF2-HMAC-SHA256 password verification (`hashlib.pbkdf2_hmac` + `hmac.compare_digest`).
+- Strict separation between `owner` (Team Lead / Organization Owner — full JSON write access),
+  `mentor` (Mentor feedback access), and `student` (Team Member — strictly read-only access).
+- Secret redaction so tokens/PEM keys never leak into error messages or logs.
+- Safe Markdown sanitization to strip unsafe `<script>`, `<iframe>`, `javascript:` links.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import html
-import os
 import re
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.config import to_plain_dict
 
 
 class UserRole(str, Enum):
-    """Supported application roles."""
+    """Supported dashboard user roles."""
 
-    OWNER = "owner"      # Organization Owner / Team Lead (full read + GitHub JSON write access)
-    MENTOR = "mentor"    # Co-mentor / evaluator (read + review evaluation access)
-    STUDENT = "student"  # Student team member (strictly read-only access to assigned repository)
+    OWNER = "owner"
+    MENTOR = "mentor"
+    STUDENT = "student"
+
+
+PBKDF2_ITERATIONS: int = 260_000
+
+
+def hash_password_pbkdf2(password: str, salt: Optional[str] = None, iterations: int = PBKDF2_ITERATIONS) -> str:
+    """Create a salted PBKDF2-HMAC-SHA256 password hash string."""
+    if not password:
+        raise ValueError("Password cannot be empty.")
+    salt_hex = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt_hex.encode("utf-8"),
+        iterations,
+    )
+    return f"pbkdf2_sha256${iterations}${salt_hex}${dk.hex()}"
+
+
+def verify_password_pbkdf2(password: str, stored_hash: str) -> bool:
+    """Verify a password against a stored `pbkdf2_sha256$iterations$salt$hex` hash in constant time."""
+    if not password or not stored_hash:
+        return False
+    parts = stored_hash.strip().split("$")
+    if len(parts) != 4 or parts[0] != "pbkdf2_sha256":
+        return False
+    try:
+        iterations = int(parts[1])
+        salt_hex = parts[2]
+        expected_hex = parts[3]
+    except ValueError:
+        return False
+
+    candidate_dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt_hex.encode("utf-8"),
+        iterations,
+    ).hex()
+    return hmac.compare_digest(candidate_dk, expected_hex)
+
+
+_SECRET_PATTERNS = [
+    re.compile(r"(gh[pousr]_[A-Za-z0-9_]{8,})"),
+    re.compile(r"(github_pat_[A-Za-z0-9_]{12,})"),
+    re.compile(r"(Bearer\s+[A-Za-z0-9\-._~+/]+=*)", re.IGNORECASE),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(pbkdf2_sha256\$\d+\$[A-Za-z0-9]+\$[A-Za-z0-9]+)"),
+]
+
+
+def redact_secrets(text: Optional[str]) -> str:
+    """Mask any GitHub PATs, Bearer tokens, private keys, or password hashes from strings."""
+    if not text:
+        return ""
+    cleaned = str(text)
+    for pattern in _SECRET_PATTERNS:
+        cleaned = pattern.sub("[REDACTED_SECRET]", cleaned)
+    return cleaned
+
+
+_UNSAFE_HTML_TAG_RE = re.compile(
+    r"<\s*/?\s*(script|iframe|object|embed|form|input|button|style|link|meta)\b[^>]*>",
+    re.IGNORECASE,
+)
+_JS_LINK_RE = re.compile(r"javascript\s*:", re.IGNORECASE)
+
+
+def sanitize_markdown_for_display(md_text: Optional[str]) -> str:
+    """Sanitize repository Markdown content prior to rendering."""
+    if not md_text:
+        return ""
+    cleaned = _UNSAFE_HTML_TAG_RE.sub("", md_text)
+    cleaned = _JS_LINK_RE.sub("blocked-js:", cleaned)
+    return cleaned
 
 
 @dataclass(frozen=True)
 class AuthenticatedUser:
-    """Represents a verified dashboard user session."""
+    """Authenticated user context with RBAC helpers."""
 
     username: str
     display_name: str
     role: UserRole
     allowed_repos: Tuple[str, ...] = field(default_factory=tuple)
-    email: Optional[str] = None
-    csrf_token: str = field(default_factory=lambda: secrets.token_urlsafe(24))
 
     def can_access_repo(self, repo_name: str) -> bool:
-        """
-        Server-side authorization check for whether this user can access `repo_name`.
-        """
-        normalized = (repo_name or "").strip().lower()
-        if not normalized:
+        """Return True if this user is permitted to view `repo_name`."""
+        target = (repo_name or "").strip().lower()
+        if not target:
             return False
-        if self.role in (UserRole.OWNER, UserRole.MENTOR):
-            if "*" in self.allowed_repos:
-                return True
-            return normalized in {r.lower() for r in self.allowed_repos}
-        if self.role == UserRole.STUDENT:
-            explicit_allowed = {r.lower() for r in self.allowed_repos if r != "*"}
-            return normalized in explicit_allowed
-        return False
+        if self.role == UserRole.OWNER and ("*" in self.allowed_repos or not self.allowed_repos):
+            return True
+        normalized = {r.strip().lower() for r in self.allowed_repos}
+        return "*" in normalized or target in normalized
 
     def can_edit_repo_metadata(self, repo_name: str) -> bool:
         """
-        Only users configured with `role = "owner"` (Team Leads / Organization Owners)
-        for `repo_name` can create or edit structured JSON files in GitHub.
-        Students (`role = "student"`) are strictly read-only.
+        Return True ONLY if the user has `role = "owner"` (Team Lead / Organization Owner)
+        and is authorized for `repo_name`. Users with `role = "student"` are strictly read-only.
         """
-        if self.role != UserRole.OWNER:
-            return False
-        return self.can_access_repo(repo_name)
+        return self.role == UserRole.OWNER and self.can_access_repo(repo_name)
 
     def can_write_feedback(self, repo_name: str) -> bool:
-        """Only Owners and Mentors authorized for the repository can record review evaluations."""
-        if self.role not in (UserRole.OWNER, UserRole.MENTOR):
-            return False
-        return self.can_access_repo(repo_name)
+        """Return True if the user is an `owner` or `mentor` authorized for `repo_name`."""
+        return self.role in (UserRole.OWNER, UserRole.MENTOR) and self.can_access_repo(repo_name)
 
     def can_manage_settings(self) -> bool:
-        """Only Owners can manage settings or trigger GitHub write-back."""
-        return self.role == UserRole.OWNER
-
-
-class AuthorizationError(PermissionError):
-    """Raised when a user attempts to access a repository or action outside their scope."""
-
-
-def hash_password_pbkdf2(password: str, salt: Optional[str] = None, iterations: int = 260_000) -> str:
-    """
-    Create a PBKDF2-HMAC-SHA256 password hash string formatted as:
-    `pbkdf2_sha256$<iterations>$<salt>$<hex_digest>`
-    """
-    if not password:
-        raise ValueError("Password cannot be empty.")
-    salt_val = salt or secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt_val.encode("utf-8"),
-        iterations,
-    )
-    return f"pbkdf2_sha256${iterations}${salt_val}${dk.hex()}"
-
-
-def verify_password(password: str, stored_hash: str) -> bool:
-    """
-    Verify a password against a `pbkdf2_sha256$...` hash or a `sha256$<hex>` hash
-    using constant-time comparison (`hmac.compare_digest`).
-    """
-    if not password or not stored_hash:
-        return False
-
-    cleaned_hash = stored_hash.strip()
-    try:
-        if cleaned_hash.startswith("pbkdf2_sha256$"):
-            parts = cleaned_hash.split("$")
-            if len(parts) != 4:
-                return False
-            _, iter_str, salt, _ = parts
-            iterations = int(iter_str)
-            candidate = hash_password_pbkdf2(password, salt=salt, iterations=iterations)
-            return hmac.compare_digest(candidate, cleaned_hash)
-
-        if cleaned_hash.startswith("sha256$"):
-            _, expected_hex = cleaned_hash.split("$", 1)
-            actual_hex = hashlib.sha256(password.encode("utf-8")).hexdigest()
-            return hmac.compare_digest(actual_hex.lower(), expected_hex.strip().lower())
-
-        return False
-    except (ValueError, TypeError):
-        return False
+        """Return True if the user can access password hashing and SQLite reset utilities."""
+        return self.role in (UserRole.OWNER, UserRole.MENTOR)
 
 
 class AccessControlManager:
-    """Manages user authentication and role-based repository authorization."""
+    """Loads user credentials from Streamlit secrets and enforces per-repository authorization."""
 
-    def __init__(self, secrets_map: Optional[Mapping] = None, configured_repos: Optional[List[str]] = None):
+    def __init__(self, secrets_map: Optional[Mapping] = None, configured_repos: Optional[Iterable[str]] = None):
+        self._configured_repos: Tuple[str, ...] = tuple(configured_repos or ())
+        self._users: Dict[str, Dict[str, Any]] = {}
+        self._load_users(secrets_map)
+
+    def _load_users(self, secrets_map: Optional[Mapping]) -> None:
         plain = to_plain_dict(secrets_map) if secrets_map is not None else {}
-        self.secrets_map: Dict = plain if isinstance(plain, dict) else {}
-        self.configured_repos = tuple(configured_repos or [])
-        self._users: Dict[str, Dict] = self._load_users()
+        if not isinstance(plain, dict):
+            return
+        auth_sec = plain.get("auth", {})
+        if not isinstance(auth_sec, Mapping):
+            return
+        users_sec = auth_sec.get("users", {})
+        if not isinstance(users_sec, Mapping):
+            return
 
-    def _load_users(self) -> Dict[str, Dict]:
-        users: Dict[str, Dict] = {}
-        auth_section = self.secrets_map.get("auth", {})
-        if not isinstance(auth_section, Mapping):
-            auth_section = {}
-
-        users_cfg = auth_section.get("users", {})
-        if not isinstance(users_cfg, Mapping):
-            users_cfg = {}
-
-        for uname, udata in users_cfg.items():
-            if not isinstance(udata, Mapping):
+        for raw_username, uinfo in users_sec.items():
+            if not isinstance(uinfo, Mapping):
                 continue
-            role_str = str(udata.get("role", "mentor")).lower()
+            uname = str(raw_username).strip()
+            if not uname:
+                continue
+            pw_hash = str(uinfo.get("password_hash") or "").strip()
+            if not pw_hash:
+                continue
+            role_raw = str(uinfo.get("role") or "student").strip().lower()
             try:
-                role = UserRole(role_str)
+                role = UserRole(role_raw)
             except ValueError:
                 role = UserRole.STUDENT
 
-            allowed = udata.get("allowed_repos", list(self.configured_repos) if role != UserRole.STUDENT else [])
-            if isinstance(allowed, str):
-                allowed_tuple = tuple(r.strip() for r in allowed.split(",") if r.strip())
+            allowed_raw = uinfo.get("allowed_repos", ["*"])
+            if isinstance(allowed_raw, str):
+                allowed = tuple(r.strip() for r in allowed_raw.split(",") if r.strip())
+            elif isinstance(allowed_raw, (list, tuple)):
+                allowed = tuple(str(r).strip() for r in allowed_raw if str(r).strip())
             else:
-                allowed_tuple = tuple(str(r).strip() for r in allowed if str(r).strip())
+                allowed = ("*",)
 
-            pw_hash = str(udata.get("password_hash", "")).strip()
-            if pw_hash.startswith("<") and pw_hash.endswith(">"):
-                pw_hash = ""
-
-            users[str(uname).strip().lower()] = {
-                "username": str(uname).strip(),
-                "display_name": str(udata.get("display_name", str(uname).strip())),
-                "password_hash": pw_hash,
+            self._users[uname.lower()] = {
+                "username": uname,
+                "display_name": str(uinfo.get("display_name") or uname),
                 "role": role,
-                "allowed_repos": allowed_tuple,
-                "email": udata.get("email"),
+                "password_hash": pw_hash,
+                "allowed_repos": allowed,
             }
 
-        for idx in (1, 2):
-            env_user = os.environ.get(f"PBL_OWNER_{idx}_USERNAME")
-            env_hash = os.environ.get(f"PBL_OWNER_{idx}_PASSWORD_HASH")
-            env_name = os.environ.get(f"PBL_OWNER_{idx}_DISPLAY_NAME", f"Organization Owner {idx}")
-            if env_user and env_hash:
-                users[env_user.strip().lower()] = {
-                    "username": env_user.strip(),
-                    "display_name": env_name,
-                    "password_hash": env_hash.strip(),
-                    "role": UserRole.OWNER,
-                    "allowed_repos": self.configured_repos or ("*",),
-                    "email": os.environ.get(f"PBL_OWNER_{idx}_EMAIL"),
-                }
-
-        return users
-
     def is_auth_configured(self) -> bool:
-        """Return True if at least one user account with a valid password hash is configured."""
-        return any(bool(u.get("password_hash")) for u in self._users.values())
+        """Return True if at least one valid user account is configured in secrets."""
+        return len(self._users) > 0
 
     def authenticate(self, username: str, password: str) -> Optional[AuthenticatedUser]:
-        """Verify username and password and return an `AuthenticatedUser` on success."""
-        if not username or not password:
+        """Verify username and password in constant time and return `AuthenticatedUser` on match."""
+        key = (username or "").strip().lower()
+        record = self._users.get(key)
+        if not record:
             return None
-        lookup = username.strip().lower()
-        record = self._users.get(lookup)
-        if not record:
-            for urec in self._users.values():
-                if urec.get("display_name", "").strip().lower() == lookup:
-                    record = urec
-                    break
-        if not record:
-            verify_password(
-                password,
-                "pbkdf2_sha256$260000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000",
-            )
+        if not verify_password_pbkdf2(password, record["password_hash"]):
             return None
 
-        if not verify_password(password, record.get("password_hash", "")):
-            return None
+        raw_allowed = record["allowed_repos"]
+        if "*" in raw_allowed and self._configured_repos:
+            effective_allowed = tuple(self._configured_repos)
+        else:
+            effective_allowed = tuple(raw_allowed)
 
         return AuthenticatedUser(
             username=record["username"],
             display_name=record["display_name"],
             role=record["role"],
-            allowed_repos=record["allowed_repos"],
-            email=record.get("email"),
+            allowed_repos=effective_allowed,
         )
 
-    def authorize_repo_access(self, user: Optional[AuthenticatedUser], repo_name: str) -> None:
-        if user is None:
-            raise AuthorizationError("Authentication required to access repository data.")
-        if repo_name.lower() not in {r.lower() for r in self.configured_repos} and "*" not in user.allowed_repos:
-            raise AuthorizationError(f"Repository '{repo_name}' is not in the configured cohort registry.")
+    def authorize_repo_access(self, user: AuthenticatedUser, repo_name: str) -> None:
+        """Raise PermissionError if `user` is not authorized to access `repo_name`."""
         if not user.can_access_repo(repo_name):
-            raise AuthorizationError(
-                f"Access denied: User '{user.username}' ({user.role.value}) is not authorized for repository '{repo_name}'."
+            raise PermissionError(
+                f"User '{user.username}' ({user.role.value}) is not authorized to access '{repo_name}'."
             )
-
-    def filter_authorized_repos(self, user: Optional[AuthenticatedUser], repos: List[str]) -> List[str]:
-        if user is None:
-            return []
-        return [r for r in repos if user.can_access_repo(r)]
-
-
-_SCRIPT_TAG_RE = re.compile(r"<\s*(script|iframe|object|embed|form|style|meta|link|base)\b[^>]*>.*?<\s*/\s*\1\s*>", re.IGNORECASE | re.DOTALL)
-_SELF_CLOSING_DANGEROUS_RE = re.compile(r"<\s*(script|iframe|object|embed|meta|link|base|input|button)\b[^>]*/?\s*>", re.IGNORECASE)
-_EVENT_HANDLER_RE = re.compile(r"\bon[a-z]+\s*=\s*(['\"].*?['\"]|[^\s>]+)", re.IGNORECASE | re.DOTALL)
-_JS_URI_RE = re.compile(r"(javascript|vbscript|data)\s*:", re.IGNORECASE)
-_TOKEN_REDACT_RE = re.compile(
-    r"(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|ghs_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|Bearer\s+[A-Za-z0-9_\-\.]+)"
-)
-
-
-def sanitize_markdown_for_display(markdown_text: str) -> str:
-    if not markdown_text:
-        return ""
-    cleaned = _SCRIPT_TAG_RE.sub("[removed unsafe HTML block]", markdown_text)
-    cleaned = _SELF_CLOSING_DANGEROUS_RE.sub("[removed unsafe HTML tag]", cleaned)
-    cleaned = _EVENT_HANDLER_RE.sub("", cleaned)
-    cleaned = _JS_URI_RE.sub("blocked-scheme:", cleaned)
-    return cleaned
-
-
-def is_safe_external_url(url: Optional[str]) -> bool:
-    if not url or not isinstance(url, str):
-        return False
-    stripped = url.strip()
-    if not stripped:
-        return False
-    if _JS_URI_RE.search(stripped):
-        return False
-    parsed = urlparse(stripped)
-    if parsed.scheme in ("https", "http"):
-        return bool(parsed.netloc)
-    if parsed.scheme == "" and not stripped.startswith("//"):
-        return ".." not in stripped.split("/")
-    return False
-
-
-def redact_secrets(text: str) -> str:
-    if not text:
-        return ""
-    return _TOKEN_REDACT_RE.sub("[REDACTED_CREDENTIAL]", str(text))
-
-
-def escape_html_text(text: str) -> str:
-    return html.escape(str(text or ""), quote=True)

@@ -1,13 +1,11 @@
 """
-Team Progress, Milestones & Task Tracking View.
+Tasks, Member Contributions, Milestone Weights & Live GitHub Sync View (`src/views/tasks_progress.py`).
 
-Organized into 4 clean, emoji-free tabs:
-1. `Task Tracker`: Filterable task table with repository evidence verification and direct GitHub links.
-2. `Milestones & Weights`: Milestone completion matrix and custom weight configurator.
-3. `Member Workload`: Per-member task assignment and completion breakdown.
-4. `Edit Tasks, Progress & Milestones`: Strictly for `role = "owner"` (Team Lead) to add/edit/remove
-   tasks (`tasks/tasks.json`), update weekly progress (`project/progress.json`), and add/edit milestones
-   (`project/progress.json`) directly in GitHub without editing raw JSON files.
+Organized into 4 clean, consistent tabs:
+1. `Task Board & Filters`: Searchable, filterable task tracker with evidence verification indicators.
+2. `Member Contributions`: Per-member workload, completion rate, and verified task breakdown.
+3. `Milestone Weights`: Custom local milestone weighting and reported vs. verified comparison.
+4. `Edit Tasks, Progress & Milestones`: Owner-only interactive editors for `tasks/tasks.json` and `project/progress.json`.
 """
 
 from __future__ import annotations
@@ -16,17 +14,16 @@ from datetime import datetime, timezone
 from typing import Dict, List
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-from src.analytics import (
-    TeamEvaluationSummary,
-    is_evidence_verified_in_repo,
-)
+from src.analytics import TeamEvaluationSummary, is_evidence_verified_in_repo
 from src.config import DashboardConfig
 from src.github_client import GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser
 from src.storage import MentorLocalStore
-from src.validators import VALID_TASK_PRIORITIES, VALID_TASK_STATUSES, parse_iso_date
+from src.ui_theme import format_bool_indicator, format_task_status
+from src.validators import VALID_TASK_PRIORITIES, VALID_TASK_STATUSES
 
 
 def render_tasks_progress_page(
@@ -37,11 +34,11 @@ def render_tasks_progress_page(
     github_client: GitHubCohortClient | None = None,
     config: DashboardConfig | None = None,
 ) -> None:
-    """Render the clean, emoji-free Team Progress & Task Tracking view."""
-    st.markdown("## Progress, Milestones & Task Tracking")
+    """Render the Tasks, Member Contributions & Live GitHub Sync page."""
+    st.markdown("## Tasks, Member Contributions & Progress Sync")
     st.caption(
-        "Combines student-reported progress (`project/progress.json` and `tasks/tasks.json`) with "
-        "automated verification of linked repository evidence paths."
+        "Track itemized task execution, verify repository evidence links, analyze member contributions, "
+        "and commit task or progress updates directly to GitHub."
     )
 
     authorized_repos = [r for r in evaluations.keys() if user.can_access_repo(r)]
@@ -49,330 +46,242 @@ def render_tasks_progress_page(
         st.error("No authorized team repositories available.")
         return
 
-    if len(authorized_repos) > 1:
-        scope_options = ["All Authorized Teams"] + authorized_repos
-        selected_scope = st.selectbox("Select Scope", options=scope_options)
-        target_repos = (
-            authorized_repos
-            if selected_scope == "All Authorized Teams"
-            else [selected_scope]
+    selected_repo = (
+        authorized_repos[0]
+        if len(authorized_repos) == 1
+        else st.selectbox(
+            "Select Team",
+            options=authorized_repos,
+            format_func=lambda r: f"{r} — {evaluations[r].display_team_name}",
+            key="tasks_repo_select",
         )
-    else:
-        target_repos = [authorized_repos[0]]
+    )
+    access_manager.authorize_repo_access(user, selected_repo)
+    ev = evaluations[selected_repo]
 
-    for r in target_repos:
-        access_manager.authorize_repo_access(user, r)
+    if not ev.snapshot.accessible:
+        st.error(f"Repository `{selected_repo}` is unavailable: {ev.snapshot.error_message}")
+        return
 
-    total_t = sum(evaluations[r].task_metrics.total_tasks for r in target_repos)
-    done_t = sum(evaluations[r].task_metrics.completed_tasks for r in target_repos)
-    inprog_t = sum(evaluations[r].task_metrics.in_progress_tasks for r in target_repos)
-    overdue_t = sum(evaluations[r].task_metrics.overdue_tasks for r in target_repos)
-    blocked_t = sum(evaluations[r].task_metrics.blocked_tasks for r in target_repos)
-    verified_t = sum(evaluations[r].task_metrics.evidence_verified_tasks for r in target_repos)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total Tasks", ev.total_tasks)
+    k2.metric("Completed Tasks", f"{ev.completed_tasks} ({ev.task_completion_pct:.0f}%)")
+    k3.metric("Verified Task Progress", f"{ev.verified_task_completion_pct:.1f}%")
+    k4.metric("Overdue / Blocked", f"{len(ev.overdue_tasks)} overdue · {ev.blocked_tasks} blocked")
 
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Total Tasks", total_t)
-    m2.metric("Completed", done_t)
-    m3.metric("In Progress", inprog_t)
-    m4.metric("Evidence Verified", verified_t)
-    m5.metric("Overdue", overdue_t)
-    m6.metric("Blocked", blocked_t)
-
-    tab_tasks, tab_milestones, tab_members, tab_editor = st.tabs(
+    tab_board, tab_members, tab_weights, tab_edit = st.tabs(
         [
-            f"Task Tracker ({total_t})",
-            "Milestones & Weights",
-            "Member Workload",
+            "Task Board & Filters",
+            "Member Contributions",
+            "Milestone Weights",
             "Edit Tasks, Progress & Milestones",
         ]
     )
 
+    repo_paths_lower = {
+        e.path.strip("/").lower() for e in ev.snapshot.tree_entries if e.item_type == "file"
+    }
+
     # ------------------------------------------------------------------
-    # Tab 1: Filterable Task Tracker & Evidence Verification
+    # Tab 1: Task Board & Filters
     # ------------------------------------------------------------------
-    with tab_tasks:
-        with st.expander("Filter Tasks by Status, Priority, or Evidence Verification", expanded=False):
-            f1, f2, f3, f4 = st.columns(4)
+    with tab_board:
+        if not ev.tasks:
+            st.info(
+                f"No tasks recorded in `tasks/tasks.json` for `{selected_repo}`. "
+                "Team Leads (`role = \"owner\"`) can add tasks in the 'Edit Tasks, Progress & Milestones' tab."
+            )
+        else:
+            f1, f2, f3 = st.columns(3)
+            assignees = sorted({t.assigned_to for t in ev.tasks if t.assigned_to})
             with f1:
-                sel_statuses = st.multiselect(
-                    "Task Status",
+                status_filter = st.multiselect(
+                    "Filter by Status",
                     options=list(VALID_TASK_STATUSES),
-                    default=list(VALID_TASK_STATUSES),
+                    default=[],
+                    placeholder="All Statuses",
                 )
             with f2:
-                sel_prios = st.multiselect(
-                    "Priority",
-                    options=list(VALID_TASK_PRIORITIES),
-                    default=list(VALID_TASK_PRIORITIES),
+                assignee_filter = st.selectbox(
+                    "Filter by Assignee",
+                    options=["All Assignees"] + assignees,
                 )
             with f3:
-                evidence_filter = st.selectbox(
-                    "Evidence Filter",
-                    options=[
-                        "All Tasks",
-                        "Verified Evidence in Repo Only",
-                        "Missing / Unverified Evidence Only",
-                    ],
+                prio_filter = st.selectbox(
+                    "Filter by Priority",
+                    options=["All Priorities"] + list(VALID_TASK_PRIORITIES),
                 )
-            with f4:
-                overdue_only = st.checkbox("Show Overdue Tasks Only", value=False)
 
-        today = datetime.now(timezone.utc).date()
-        task_rows: List[Dict] = []
-
-        for r in target_repos:
-            ev = evaluations[r]
-            if not ev.snapshot.accessible or not ev.tasks:
-                continue
-            repo_paths_lower = {
-                e.path.strip("/").lower() for e in ev.snapshot.tree_entries if e.item_type == "file"
-            }
+            overdue_ids = {t.task_id for t in ev.overdue_tasks}
+            filtered_rows = []
             for t in ev.tasks:
-                if t.status not in sel_statuses or t.priority not in sel_prios:
+                if status_filter and t.status not in status_filter:
                     continue
+                if assignee_filter != "All Assignees" and t.assigned_to != assignee_filter:
+                    continue
+                if prio_filter != "All Priorities" and t.priority != prio_filter:
+                    continue
+
                 verified = is_evidence_verified_in_repo(t.evidence_link, repo_paths_lower)
-                if evidence_filter == "Verified Evidence in Repo Only" and not verified:
-                    continue
-                if evidence_filter == "Missing / Unverified Evidence Only" and verified:
-                    continue
-
-                due_dt = parse_iso_date(t.due_date)
-                is_overdue = bool(t.status != "Completed" and due_dt and due_dt < today)
-                if overdue_only and not is_overdue:
-                    continue
-
-                ev_url = ""
-                if t.evidence_link:
-                    if t.evidence_link.startswith(("https://", "http://")):
-                        ev_url = t.evidence_link
-                    else:
-                        ev_url = f"{ev.snapshot.html_url}/blob/{ev.snapshot.default_branch}/{t.evidence_link.lstrip('/')}"
-
-                row_item: Dict = {}
-                if len(target_repos) > 1:
-                    row_item["Repository"] = r
-                row_item.update(
+                filtered_rows.append(
                     {
-                        "Task ID": t.task_id,
-                        "Title": t.title,
-                        "Assigned To": t.assigned_to,
+                        "ID": t.task_id,
+                        "Task Title": t.title,
+                        "Assignee": t.assigned_to,
                         "Priority": t.priority,
-                        "Status": t.status,
-                        "Start Date": t.start_date or "-",
-                        "Due Date": t.due_date or "-",
-                        "Overdue": "Overdue" if is_overdue else "No",
+                        "Status": format_task_status(t.status),
+                        "Due Date": (
+                            f"▲ {t.due_date} (Overdue)"
+                            if t.task_id in overdue_ids
+                            else (t.due_date or "-")
+                        ),
                         "Milestone": t.related_milestone or "-",
-                        "Review": t.related_review or "-",
-                        "Evidence Path": t.evidence_link or "None",
-                        "Evidence Verified": "Verified" if verified else "Unverified",
-                        "Last Updated": t.last_updated or "-",
-                        "GitHub Evidence URL": ev_url,
+                        "Evidence": t.evidence_link or "-",
+                        "Repo Verification": (
+                            format_bool_indicator(verified, "Verified", "Unverified")
+                            if t.status == "Completed"
+                            else "-"
+                        ),
                     }
                 )
-                task_rows.append(row_item)
 
-        if not task_rows:
-            st.info("No tasks match the current filter criteria (or `tasks/tasks.json` is not reported).")
-        else:
-            st.dataframe(
-                pd.DataFrame(task_rows),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "GitHub Evidence URL": st.column_config.LinkColumn(
-                        "Evidence Link", display_text="Open Evidence"
-                    ),
-                },
-            )
+            st.dataframe(pd.DataFrame(filtered_rows), use_container_width=True, hide_index=True)
 
     # ------------------------------------------------------------------
-    # Tab 2: Milestone Completion & Weight Configuration
-    # ------------------------------------------------------------------
-    with tab_milestones:
-        ms_rows: List[Dict] = []
-        for r in target_repos:
-            ev = evaluations[r]
-            if not ev.snapshot.accessible:
-                ms_rows.append(
-                    {
-                        "Repository": r,
-                        "Progress Status": "Repository Unavailable",
-                        "Milestone Weight Sum": "-",
-                        "Weights Valid (100%)": "No",
-                        "Weighted Milestone %": "Unavailable",
-                        "Evidence-Verified Milestone %": "Unavailable",
-                        "Reported Task %": "Unavailable",
-                        "Evidence-Verified Task %": "Unavailable",
-                    }
-                )
-                continue
-
-            mm = ev.milestone_metrics
-            tm = ev.task_metrics
-            ms_rows.append(
-                {
-                    "Repository": r,
-                    "Progress Status": ev.progress_display_status,
-                    "Milestone Weight Sum": f"{mm.raw_weight_sum:.1f}%" if mm.total_milestones > 0 else "No Milestones",
-                    "Weights Valid (100%)": "Yes" if mm.weights_valid_100 else ("Normalized" if mm.total_milestones > 0 else "N/A"),
-                    "Weighted Milestone %": (
-                        f"{mm.weighted_completion_pct:.1f}%"
-                        if mm.weighted_completion_pct is not None
-                        else "Not Reported"
-                    ),
-                    "Evidence-Verified Milestone %": (
-                        f"{mm.verified_weighted_pct:.1f}%"
-                        if mm.verified_weighted_pct is not None
-                        else "Not Reported"
-                    ),
-                    "Reported Task %": (
-                        f"{tm.reported_completion_pct:.1f}%"
-                        if tm.reported_completion_pct is not None
-                        else "Not Reported"
-                    ),
-                    "Evidence-Verified Task %": (
-                        f"{tm.verified_completion_pct:.1f}%"
-                        if tm.verified_completion_pct is not None
-                        else "Not Reported"
-                    ),
-                }
-            )
-            if mm.weight_warning:
-                st.warning(f"**[{r}]** {mm.weight_warning}")
-
-        st.dataframe(pd.DataFrame(ms_rows), use_container_width=True, hide_index=True)
-
-        if len(target_repos) == 1:
-            single_ev = evaluations[target_repos[0]]
-            if single_ev.progress and single_ev.progress.milestones:
-                st.markdown("##### Individual Milestones (`project/progress.json`)")
-                m_detail_rows = [
-                    {
-                        "Milestone ID": m.milestone_id,
-                        "Title": m.title,
-                        "Status": m.status,
-                        "Weight (%)": f"{m.weight:.1f}%",
-                        "Completion (%)": f"{m.completion_pct:.1f}%" if m.completion_pct is not None else "0.0%",
-                        "Due Date": m.due_date or "-",
-                        "Completed Date": m.completed_date or "-",
-                        "Evidence Path": m.evidence_path or "-",
-                    }
-                    for m in single_ev.progress.milestones
-                ]
-                st.dataframe(pd.DataFrame(m_detail_rows), use_container_width=True, hide_index=True)
-
-                if user.can_edit_repo_metadata(single_ev.repo_name):
-                    with st.expander("Customize Local Milestone Weight Overrides", expanded=False):
-                        saved_weights: Dict[str, float] = (
-                            local_store.get_setting(f"milestone_weights::{single_ev.repo_name}", default={}) or {}
-                        )
-                        updated_weights: Dict[str, float] = {}
-                        w_cols = st.columns(min(4, len(single_ev.progress.milestones)))
-                        for idx, m in enumerate(single_ev.progress.milestones):
-                            default_w = float(saved_weights.get(m.milestone_id, m.weight))
-                            with w_cols[idx % len(w_cols)]:
-                                updated_weights[m.milestone_id] = st.number_input(
-                                    f"{m.milestone_id}: {m.title[:28]}",
-                                    min_value=0.0,
-                                    max_value=100.0,
-                                    value=default_w,
-                                    step=5.0,
-                                    key=f"mw_{single_ev.repo_name}_{m.milestone_id}",
-                                )
-                        total_custom = sum(updated_weights.values())
-                        st.caption(f"Configured Total Weight: **{total_custom:.1f}%** (Required: 100.0%)")
-                        if abs(total_custom - 100.0) > 0.05:
-                            st.error("Total milestone weights must equal 100.0% before saving.")
-                        elif st.button("Save Custom Milestone Weights", key=f"save_mw_{single_ev.repo_name}"):
-                            local_store.set_setting(
-                                f"milestone_weights::{single_ev.repo_name}",
-                                updated_weights,
-                                updated_by=user.username,
-                            )
-                            local_store.log_audit_event(
-                                username=user.username,
-                                role=user.role.value,
-                                action="update_milestone_weights",
-                                target_repo=single_ev.repo_name,
-                                details=f"Updated milestone weights: {updated_weights}",
-                            )
-                            st.success("Custom milestone weights saved.")
-                            st.rerun()
-
-    # ------------------------------------------------------------------
-    # Tab 3: Individual Member Workload & Completion Breakdown
+    # Tab 2: Member Contributions
     # ------------------------------------------------------------------
     with tab_members:
-        member_rows: List[Dict] = []
-        for r in target_repos:
-            ev = evaluations[r]
-            for assignee, counts in ev.task_metrics.member_task_breakdown.items():
-                total_m = counts.get("total", 0)
-                done_m = counts.get("completed", 0)
-                pct_m = round((done_m / total_m) * 100.0, 1) if total_m > 0 else 0.0
-                row_m: Dict = {}
-                if len(target_repos) > 1:
-                    row_m["Repository"] = r
-                row_m.update(
-                    {
-                        "Team Member": assignee,
-                        "Total Assigned": total_m,
-                        "Completed": done_m,
-                        "In Progress": counts.get("in_progress", 0),
-                        "Blocked": counts.get("blocked", 0),
-                        "Not Started": counts.get("not_started", 0),
-                        "Overdue": counts.get("overdue", 0),
-                        "Individual Completion %": f"{pct_m:.1f}%",
-                    }
-                )
-                member_rows.append(row_m)
-        if member_rows:
-            st.dataframe(pd.DataFrame(member_rows), use_container_width=True, hide_index=True)
+        if not ev.member_stats:
+            st.info("No member task statistics available yet.")
         else:
-            st.info("No member task records available to summarize.")
+            mem_rows = [
+                {
+                    "Member": ms.member_name,
+                    "Role": ms.role,
+                    "Assigned": ms.assigned_count,
+                    "Completed": ms.completed_count,
+                    "Verified Completed": ms.verified_completed_count,
+                    "In Progress": ms.in_progress_count,
+                    "Blocked": ms.blocked_count,
+                    "Overdue": ms.overdue_count,
+                    "Completion Rate (%)": ms.completion_rate_pct,
+                }
+                for ms in ev.member_stats
+            ]
+            m_df = pd.DataFrame(mem_rows)
+            st.dataframe(m_df, use_container_width=True, hide_index=True)
+
+            fig = px.bar(
+                m_df,
+                x="Member",
+                y=["Completed", "In Progress", "Blocked"],
+                barmode="group",
+                title="Task Execution Breakdown by Team Member",
+                color_discrete_map={
+                    "Completed": "#16A34A",
+                    "In Progress": "#2563EB",
+                    "Blocked": "#DC2626",
+                },
+            )
+            fig.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20))
+            st.plotly_chart(fig, use_container_width=True)
 
     # ------------------------------------------------------------------
-    # Tab 4: Live Two-Way GitHub Editor for tasks/tasks.json & project/progress.json
-    # Strictly gated to `role = "owner"` (Team Lead / Organization Owner).
+    # Tab 3: Milestone Weights & Progress Discrepancy
     # ------------------------------------------------------------------
-    with tab_editor:
-        edit_repo = (
-            target_repos[0]
-            if len(target_repos) == 1
-            else st.selectbox("Select Repository to Update", options=target_repos, key="editor_repo_sel")
+    with tab_weights:
+        st.markdown("#### Milestone Progress & Custom Weighting")
+        if ev.progress and ev.progress.milestones:
+            saved_weights = local_store.get_setting(f"milestone_weights::{selected_repo}", default={}) or {}
+            ms_rows = [
+                {
+                    "ID": m.milestone_id,
+                    "Milestone": m.title,
+                    "Status": format_task_status(m.status),
+                    "Repo Weight (%)": m.weight,
+                    "Active Weight (%)": saved_weights.get(m.milestone_id, m.weight),
+                    "Completion (%)": m.completion_pct,
+                    "Evidence Path": m.evidence_path or "-",
+                }
+                for m in ev.progress.milestones
+            ]
+            st.dataframe(pd.DataFrame(ms_rows), use_container_width=True, hide_index=True)
+
+            if user.can_write_feedback(selected_repo):
+                with st.expander("Customize Local Milestone Evaluation Weights", expanded=False):
+                    with st.form(f"custom_ms_weights_{selected_repo}"):
+                        new_weights: Dict[str, float] = {}
+                        cols = st.columns(min(4, len(ev.progress.milestones)))
+                        for idx, m in enumerate(ev.progress.milestones):
+                            col = cols[idx % len(cols)]
+                            new_weights[m.milestone_id] = col.number_input(
+                                f"{m.milestone_id} Weight (%)",
+                                min_value=0.0,
+                                max_value=100.0,
+                                value=float(saved_weights.get(m.milestone_id, m.weight)),
+                                step=5.0,
+                            )
+                        if st.form_submit_button("Save Custom Weights Locally"):
+                            local_store.set_setting(f"milestone_weights::{selected_repo}", new_weights)
+                            st.success("Saved custom milestone weights.")
+                            st.rerun()
+        else:
+            st.info("No milestones defined in `project/progress.json` yet.")
+
+    # ------------------------------------------------------------------
+    # Tab 4: Owner-Only Live GitHub Editors (Tasks, Progress & Milestones)
+    # ------------------------------------------------------------------
+    with tab_edit:
+        _render_tasks_and_progress_editors(
+            edit_repo=selected_repo,
+            ev_edit=ev,
+            user=user,
+            github_client=github_client,
+            local_store=local_store,
         )
-        ev_edit = evaluations[edit_repo]
 
-        if not user.can_edit_repo_metadata(edit_repo):
-            st.info(
-                "Read-Only Mode: Only Team Leads / Owners (`role = \"owner\"` in Secrets) can add or edit "
-                "tasks, progress reports, and milestones. Team members (`role = \"student\"`) have read-only access."
-            )
-        elif github_client is None:
-            st.error("GitHub client is not initialized.")
-        elif not ev_edit.snapshot.accessible:
-            st.error(f"Repository `{edit_repo}` is not accessible.")
-        else:
-            st.caption(
-                f"Updates committed here write directly to `{edit_repo}` on GitHub, keeping both the "
-                "Team Dashboard and the Mentor Dashboard synchronized."
-            )
-            editor_mode = st.radio(
-                "Select Section to Update",
-                options=[
-                    "Tasks (tasks/tasks.json)",
-                    "Weekly Progress Summary (project/progress.json)",
-                    "Milestones & Weights (project/progress.json)",
-                ],
-                horizontal=True,
-            )
 
-            if editor_mode.startswith("Tasks"):
-                _render_tasks_json_editor(edit_repo, ev_edit, user, github_client, local_store)
-            elif editor_mode.startswith("Weekly Progress"):
-                _render_progress_summary_editor(edit_repo, ev_edit, user, github_client, local_store)
-            else:
-                _render_milestones_json_editor(edit_repo, ev_edit, user, github_client, local_store)
+def _render_tasks_and_progress_editors(
+    edit_repo: str,
+    ev_edit: TeamEvaluationSummary,
+    user: AuthenticatedUser,
+    github_client: GitHubCohortClient | None,
+    local_store: MentorLocalStore,
+) -> None:
+    if not user.can_edit_repo_metadata(edit_repo):
+        st.info(
+            f"Signed in as `{user.username}` (`role = \"{user.role.value}\"`). "
+            "You have **read-only** access. Only Team Leads (`role = \"owner\"` in Secrets) "
+            "can add or update `tasks/tasks.json` and `project/progress.json`."
+        )
+        return
+
+    if github_client is None or not github_client.auth.is_configured:
+        st.warning("Configure a GitHub token (`[github].token`) in Secrets to commit changes to GitHub.")
+        return
+
+    st.caption(
+        f"Team Lead Write Mode (`role = \"owner\"`): Commit updates directly to `tasks/tasks.json` and "
+        f"`project/progress.json` in `{edit_repo}`."
+    )
+
+    sub_section = st.radio(
+        "Select Section to Update",
+        options=[
+            "1. Tasks (tasks/tasks.json)",
+            "2. Weekly Progress Summary (project/progress.json)",
+            "3. Milestones (project/progress.json)",
+        ],
+        horizontal=True,
+        key=f"tp_edit_sec_{edit_repo}",
+    )
+
+    if sub_section.startswith("1."):
+        _render_tasks_json_editor(edit_repo, ev_edit, user, github_client, local_store)
+    elif sub_section.startswith("2."):
+        _render_progress_summary_editor(edit_repo, ev_edit, user, github_client, local_store)
+    else:
+        _render_milestones_json_editor(edit_repo, ev_edit, user, github_client, local_store)
 
 
 def _render_tasks_json_editor(
@@ -383,46 +292,47 @@ def _render_tasks_json_editor(
     local_store: MentorLocalStore,
 ) -> None:
     existing_ids = [t.task_id for t in ev_edit.tasks]
-    mode_opts = ["Update Existing Task", "Create New Task", "Delete Task"] if existing_ids else ["Create New Task"]
-    mode = st.radio(
-        "Task Action",
-        options=mode_opts,
-        horizontal=True,
-        key=f"task_mode_{edit_repo}",
-    )
+    mode_options = ["Add New Task"]
+    if existing_ids:
+        mode_options.extend(["Update Existing Task", "Delete Task"])
+
+    mode = st.radio("Task Operation", options=mode_options, horizontal=True, key=f"task_op_{edit_repo}")
 
     if mode == "Delete Task" and existing_ids:
-        del_id = st.selectbox(
+        del_tid = st.selectbox(
             "Select Task to Delete",
             options=existing_ids,
-            format_func=lambda tid: next((f"{t.task_id}: {t.title} ({t.assigned_to})" for t in ev_edit.tasks if t.task_id == tid), tid),
+            format_func=lambda tid: next(
+                (f"{t.task_id}: {t.title} ({t.assigned_to})" for t in ev_edit.tasks if t.task_id == tid),
+                tid,
+            ),
         )
-        if st.button(f"Delete Task `{del_id}` and Commit to GitHub"):
+        if st.button(f"Delete Task `{del_tid}` & Commit to GitHub"):
             remaining = [
                 {
-                    "task_id": item.task_id,
-                    "title": item.title,
-                    "description": item.description,
-                    "assigned_to": item.assigned_to,
-                    "priority": item.priority,
-                    "status": item.status,
-                    "start_date": item.start_date,
-                    "due_date": item.due_date,
-                    "completed_date": item.completed_date,
-                    "related_milestone": item.related_milestone,
-                    "related_review": item.related_review,
-                    "evidence_link": item.evidence_link,
-                    "last_updated": item.last_updated,
-                    "weight": item.weight,
+                    "task_id": t.task_id,
+                    "title": t.title,
+                    "description": t.description,
+                    "assigned_to": t.assigned_to,
+                    "priority": t.priority,
+                    "status": t.status,
+                    "start_date": t.start_date,
+                    "due_date": t.due_date,
+                    "completed_date": t.completed_date,
+                    "related_milestone": t.related_milestone,
+                    "related_review": t.related_review,
+                    "evidence_link": t.evidence_link,
+                    "last_updated": t.last_updated,
+                    "weight": t.weight,
                 }
-                for item in ev_edit.tasks
-                if item.task_id != del_id
+                for t in ev_edit.tasks
+                if t.task_id != del_tid
             ]
             ok, msg = github_client.commit_structured_json(
                 repo_name=edit_repo,
                 file_path="tasks/tasks.json",
                 json_payload={"tasks": remaining},
-                commit_message=f"chore(tasks): delete task {del_id} by {user.username}",
+                commit_message=f"chore(tasks): delete task {del_tid} by {user.username}",
                 branch=ev_edit.snapshot.default_branch,
             )
             local_store.log_audit_event(user.username, user.role.value, "delete_task_json", edit_repo, msg)
@@ -463,12 +373,13 @@ def _render_tasks_json_editor(
         )
         fa1, fa2, fb1 = st.columns(3)
         t_assignee = fa1.text_input(
-            "Assigned To (Teammate Name)",
+            "Assigned To",
             value=(
                 selected_existing.assigned_to
                 if selected_existing
                 else (member_names[0] if member_names else "")
             ),
+            placeholder="Team member name",
         )
         t_prio = fa2.selectbox(
             "Priority",
@@ -489,35 +400,43 @@ def _render_tasks_json_editor(
             ),
         )
 
-        fb2, fb3, fc1, fc2 = st.columns(4)
-        t_start = fb2.text_input(
+        fc1, fc2, fc3, fc4 = st.columns(4)
+        t_start = fc1.text_input(
             "Start Date (YYYY-MM-DD)",
-            value=selected_existing.start_date or "" if selected_existing else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            value=selected_existing.start_date or "" if selected_existing else "",
         )
-        t_due = fb3.text_input(
+        t_due = fc2.text_input(
             "Due Date (YYYY-MM-DD)",
             value=selected_existing.due_date or "" if selected_existing else "",
         )
-        t_ms = fc1.text_input(
+        t_ms = fc3.text_input(
             "Related Milestone",
             value=selected_existing.related_milestone or "M1" if selected_existing else "M1",
         )
-        t_rev = fc2.text_input(
-            "Related Review",
-            value=selected_existing.related_review or "review-1" if selected_existing else "review-1",
-        )
-        t_ev = st.text_input(
-            "Evidence Path in Repository (Required when status is Completed)",
-            value=selected_existing.evidence_link or "" if selected_existing else "",
-            placeholder="e.g., documentation/design.pdf or research/survey.md",
+        t_weight = fc4.number_input(
+            "Task Weight",
+            min_value=0.1,
+            max_value=10.0,
+            value=float(selected_existing.weight if selected_existing else 1.0),
+            step=0.5,
         )
 
-        save_task_btn = st.form_submit_button(f"Commit Task to `{edit_repo}` on GitHub")
-        if save_task_btn:
+        t_ev = st.text_input(
+            "Repository Evidence Path or URL",
+            value=selected_existing.evidence_link or "" if selected_existing else "",
+            placeholder="e.g., research/literature_review.md or src/sensor_node.py",
+        )
+
+        if st.form_submit_button("Commit Tasks to `tasks/tasks.json` on GitHub"):
             if not t_id.strip() or not t_title.strip():
                 st.error("Task ID and Task Title are required.")
             else:
                 today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                comp_date = (
+                    today_str
+                    if t_status == "Completed"
+                    else (selected_existing.completed_date if selected_existing else None)
+                )
                 new_task_dict = {
                     "task_id": t_id.strip(),
                     "title": t_title.strip(),
@@ -527,12 +446,12 @@ def _render_tasks_json_editor(
                     "status": t_status,
                     "start_date": t_start.strip() or None,
                     "due_date": t_due.strip() or None,
-                    "completed_date": today_str if t_status == "Completed" else None,
+                    "completed_date": comp_date,
                     "related_milestone": t_ms.strip() or None,
-                    "related_review": t_rev.strip() or None,
+                    "related_review": selected_existing.related_review if selected_existing else 1,
                     "evidence_link": t_ev.strip() or None,
                     "last_updated": today_str,
-                    "weight": selected_existing.weight if selected_existing else 1.0,
+                    "weight": t_weight,
                 }
                 updated_list = []
                 replaced = False
@@ -599,10 +518,46 @@ def _default_milestones_list(prog) -> List[Dict]:
             for m in prog.milestones
         ]
     return [
-        {"milestone_id": "M1", "title": "Problem Validation & Literature Review", "status": "Not Started", "weight": 20.0, "completion_pct": 0.0, "due_date": None, "completed_date": None, "evidence_path": "research/"},
-        {"milestone_id": "M2", "title": "Architecture & System Design", "status": "Not Started", "weight": 25.0, "completion_pct": 0.0, "due_date": None, "completed_date": None, "evidence_path": "documentation/"},
-        {"milestone_id": "M3", "title": "Prototype Implementation & Testing", "status": "Not Started", "weight": 30.0, "completion_pct": 0.0, "due_date": None, "completed_date": None, "evidence_path": "datasets/"},
-        {"milestone_id": "M4", "title": "Final Evaluation & Handover", "status": "Not Started", "weight": 25.0, "completion_pct": 0.0, "due_date": None, "completed_date": None, "evidence_path": "deliverables/"},
+        {
+            "milestone_id": "M1",
+            "title": "Problem Validation & Literature Review",
+            "status": "Not Started",
+            "weight": 20.0,
+            "completion_pct": 0.0,
+            "due_date": None,
+            "completed_date": None,
+            "evidence_path": "research/",
+        },
+        {
+            "milestone_id": "M2",
+            "title": "Architecture & System Design",
+            "status": "Not Started",
+            "weight": 25.0,
+            "completion_pct": 0.0,
+            "due_date": None,
+            "completed_date": None,
+            "evidence_path": "documentation/",
+        },
+        {
+            "milestone_id": "M3",
+            "title": "Prototype Implementation & Testing",
+            "status": "Not Started",
+            "weight": 30.0,
+            "completion_pct": 0.0,
+            "due_date": None,
+            "completed_date": None,
+            "evidence_path": "datasets/",
+        },
+        {
+            "milestone_id": "M4",
+            "title": "Final Evaluation & Handover",
+            "status": "Not Started",
+            "weight": 25.0,
+            "completion_pct": 0.0,
+            "due_date": None,
+            "completed_date": None,
+            "evidence_path": "deliverables/",
+        },
     ]
 
 
@@ -689,7 +644,14 @@ def _render_milestones_json_editor(
     pick_m = st.selectbox(
         "Select Milestone to Edit (or '+ Add New Milestone')",
         options=existing_mids + ["+ Add New Milestone"],
-        format_func=lambda x: x if x.startswith("+") else next((f"{m['milestone_id']}: {m['title']} ({m['status']}, {m['weight']}%)" for m in current_ms if m["milestone_id"] == x), x),
+        format_func=lambda x: (
+            x
+            if x.startswith("+")
+            else next(
+                (f"{m['milestone_id']}: {m['title']} ({m['status']}, {m['weight']}%)" for m in current_ms if m["milestone_id"] == x),
+                x,
+            )
+        ),
     )
     sel_m = None if pick_m.startswith("+") else next((m for m in current_ms if m["milestone_id"] == pick_m), None)
 
@@ -700,14 +662,33 @@ def _render_milestones_json_editor(
         m_status = c3.selectbox(
             "Status",
             options=list(VALID_TASK_STATUSES),
-            index=list(VALID_TASK_STATUSES).index(sel_m["status"]) if sel_m and sel_m["status"] in VALID_TASK_STATUSES else 0,
+            index=(
+                list(VALID_TASK_STATUSES).index(sel_m["status"])
+                if sel_m and sel_m["status"] in VALID_TASK_STATUSES
+                else 0
+            ),
         )
 
         c4, c5, c6, c7 = st.columns(4)
-        m_weight = c4.number_input("Weight (%)", min_value=0.0, max_value=100.0, value=float(sel_m["weight"] if sel_m else 25.0), step=5.0)
-        m_pct = c5.number_input("Completion (%)", min_value=0.0, max_value=100.0, value=float(sel_m.get("completion_pct") or 0.0) if sel_m else 0.0, step=5.0)
+        m_weight = c4.number_input(
+            "Weight (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(sel_m["weight"] if sel_m else 25.0),
+            step=5.0,
+        )
+        m_pct = c5.number_input(
+            "Completion (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=float(sel_m.get("completion_pct") or 0.0) if sel_m else 0.0,
+            step=5.0,
+        )
         m_due = c6.text_input("Due Date (YYYY-MM-DD)", value=sel_m.get("due_date") or "" if sel_m else "")
-        m_ev = c7.text_input("Evidence Path", value=sel_m.get("evidence_path") or "" if sel_m else "deliverables/")
+        m_ev = c7.text_input(
+            "Evidence Path",
+            value=sel_m.get("evidence_path") or "" if sel_m else "deliverables/",
+        )
 
         if st.form_submit_button(f"Save Milestone to `project/progress.json` in `{edit_repo}`"):
             if not m_id.strip() or not m_title.strip():
@@ -721,7 +702,11 @@ def _render_milestones_json_editor(
                     "weight": m_weight,
                     "completion_pct": 100.0 if m_status == "Completed" else m_pct,
                     "due_date": m_due.strip() or None,
-                    "completed_date": today_str if m_status == "Completed" else (sel_m.get("completed_date") if sel_m else None),
+                    "completed_date": (
+                        today_str
+                        if m_status == "Completed"
+                        else (sel_m.get("completed_date") if sel_m else None)
+                    ),
                     "evidence_path": m_ev.strip() or None,
                 }
                 updated_ms = []
@@ -738,9 +723,15 @@ def _render_milestones_json_editor(
                 prog_payload = {
                     "last_updated": today_str,
                     "current_phase": prog.current_phase if prog else "In Progress",
-                    "overall_reported_pct": prog.overall_reported_pct if prog and prog.overall_reported_pct is not None else 0.0,
+                    "overall_reported_pct": (
+                        prog.overall_reported_pct
+                        if prog and prog.overall_reported_pct is not None
+                        else 0.0
+                    ),
                     "summary": prog.summary if prog else "",
-                    "accomplishments_since_last_update": prog.accomplishments_since_last_update if prog else [],
+                    "accomplishments_since_last_update": (
+                        prog.accomplishments_since_last_update if prog else []
+                    ),
                     "blockers": prog.blockers if prog else [],
                     "next_steps": prog.next_steps if prog else [],
                     "milestones": updated_ms,

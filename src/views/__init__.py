@@ -1,1 +1,1 @@
-"""Streamlit UI view modules for the PBL Cohort-X Mentor Dashboard."""
+"""View modules for the PBL Cohort-X Mentor & Team Dashboard."""

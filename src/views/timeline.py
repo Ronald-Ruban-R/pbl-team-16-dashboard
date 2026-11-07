@@ -1,29 +1,25 @@
 """
-Timeline & Milestone Management View.
+Timeline, Schedule Variance & Interactive `project/timeline.json` Editor (`src/views/timeline.py`).
 
-Organized into 2 clean, emoji-free tabs:
-1. `Timeline & Schedule Variance`: Unified chronological schedule across `project/timeline.json`,
-   milestones (`project/progress.json`), reviews (`reviews/*.json`), and task deadlines (`tasks/tasks.json`).
-2. `Edit Timeline Events`: Strictly for `role = "owner"` (Team Lead) to add, update, or remove
-   events in `project/timeline.json` directly in GitHub.
+Organized into two clean tabs:
+1. `Timeline & Schedule Variance`: Chronological schedule table and planned vs. actual variance analysis.
+2. `Edit Timeline Events`: Owner-only interactive form to add, update, or delete events in `project/timeline.json`.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Dict, List
 
 import pandas as pd
 import streamlit as st
 
-from src.analytics import TeamEvaluationSummary
+from src.analytics import TeamEvaluationSummary, parse_iso_date
 from src.github_client import GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser
 from src.storage import MentorLocalStore
-from src.validators import VALID_TASK_STATUSES, parse_iso_date
-
-
-TIMELINE_CATEGORIES = ("Milestone", "Review", "Competition", "Deliverable", "Task")
+from src.ui_theme import format_task_status
+from src.validators import VALID_TASK_STATUSES, VALID_TIMELINE_TYPES
 
 
 def render_timeline_page(
@@ -33,11 +29,10 @@ def render_timeline_page(
     github_client: GitHubCohortClient | None = None,
     local_store: MentorLocalStore | None = None,
 ) -> None:
-    """Render the clean, emoji-free Chronological Timeline & Schedule Slippage view."""
-    st.markdown("## Chronological Timeline & Schedule Variance")
+    """Render the Timeline & Milestones view with owner-only `project/timeline.json` editor."""
+    st.markdown("## Project Timeline & Milestones")
     st.caption(
-        "Unified schedule across planned milestones, review deadlines, competition dates, and task due dates, "
-        "distinguishing planned dates from actual completion dates."
+        "Monitor planned vs. actual milestone dates, schedule variance, and manage `project/timeline.json`."
     )
 
     authorized_repos = [r for r in evaluations.keys() if user.can_access_repo(r)]
@@ -45,289 +40,268 @@ def render_timeline_page(
         st.error("No authorized team repositories available.")
         return
 
-    if len(authorized_repos) > 1:
-        scope = st.selectbox(
-            "Timeline Scope",
-            options=["All Authorized Teams"] + authorized_repos,
-            key="timeline_scope_select",
+    selected_repo = (
+        authorized_repos[0]
+        if len(authorized_repos) == 1
+        else st.selectbox(
+            "Select Team",
+            options=authorized_repos,
+            format_func=lambda r: f"{r} — {evaluations[r].display_team_name}",
+            key="timeline_repo_select",
         )
-        target_repos = authorized_repos if scope == "All Authorized Teams" else [scope]
-    else:
-        target_repos = [authorized_repos[0]]
+    )
+    access_manager.authorize_repo_access(user, selected_repo)
+    ev = evaluations[selected_repo]
 
-    for r in target_repos:
-        access_manager.authorize_repo_access(user, r)
+    if not ev.snapshot.accessible:
+        st.error(f"Repository `{selected_repo}` is unavailable: {ev.snapshot.error_message}")
+        return
 
-    tab_view, tab_edit = st.tabs(
+    tab_schedule, tab_edit = st.tabs(
         [
             "Timeline & Schedule Variance",
             "Edit Timeline Events (project/timeline.json)",
         ]
     )
 
-    with tab_view:
-        cat_filter = st.multiselect(
-            "Filter by Event Category",
-            options=["Milestone", "Review", "Competition", "Deliverable", "Task Deadline"],
-            default=["Milestone", "Review", "Competition", "Deliverable", "Task Deadline"],
-        )
+    with tab_schedule:
+        if not ev.timeline:
+            st.info(
+                f"No timeline events found in `project/timeline.json` for `{selected_repo}`. "
+                "Team Leads (`role = \"owner\"`) can add timeline events in the 'Edit Timeline Events' tab."
+            )
+        else:
+            now = datetime.now(timezone.utc)
+            completed_events = sum(1 for e in ev.timeline if e.status == "Completed")
+            delayed_events = 0
+            tl_rows = []
+            for e in ev.timeline:
+                p_dt = parse_iso_date(e.planned_date)
+                a_dt = parse_iso_date(e.actual_date)
+                variance_str = "-"
+                if p_dt and a_dt:
+                    diff_days = (a_dt - p_dt).days
+                    if diff_days > 0:
+                        variance_str = f"+{diff_days}d late"
+                        delayed_events += 1
+                    elif diff_days < 0:
+                        variance_str = f"{abs(diff_days)}d early"
+                    else:
+                        variance_str = "On time"
+                elif p_dt and e.status != "Completed" and p_dt < now:
+                    overdue_days = (now - p_dt).days
+                    variance_str = f"Overdue ({overdue_days}d)"
+                    delayed_events += 1
 
-        today = datetime.now(timezone.utc).date()
-        timeline_rows: List[Dict[str, Any]] = []
-
-        for r in target_repos:
-            ev = evaluations[r]
-            if not ev.snapshot.accessible:
-                continue
-
-            for item in ev.timeline_events:
-                cat = item.category if item.category in ("Milestone", "Review", "Competition", "Deliverable") else "Milestone"
-                if cat not in cat_filter:
-                    continue
-                p_dt = parse_iso_date(item.planned_date)
-                a_dt = parse_iso_date(item.actual_date)
-                slip_days = (a_dt - p_dt).days if (p_dt and a_dt) else (
-                    (today - p_dt).days if (p_dt and item.status != "Completed" and today > p_dt) else 0
-                )
-                timeline_rows.append(
+                tl_rows.append(
                     {
-                        "Repository": r,
-                        "Category": cat,
-                        "Event / Milestone": item.title,
-                        "Planned Date": item.planned_date or "TBD",
-                        "Actual Date": item.actual_date or ("Pending" if item.status != "Completed" else "Not Recorded"),
-                        "Status": item.status,
-                        "Schedule Variance": f"+{slip_days}d delay" if slip_days > 0 else ("On Time" if p_dt else "-"),
-                        "Delay / Change Notes": item.delay_reason or "",
-                        "Evidence": item.evidence_path or "",
-                        "_sort_date": item.planned_date or "9999-12-31",
+                        "ID": e.event_id,
+                        "Event / Milestone": e.title,
+                        "Type": e.event_type,
+                        "Planned Date": e.planned_date or "-",
+                        "Actual Date": e.actual_date or "-",
+                        "Status": format_task_status(e.status),
+                        "Variance": variance_str,
+                        "Owner": e.owner or "-",
+                        "Description": e.description or "",
                     }
                 )
 
-            if ev.progress and "Milestone" in cat_filter:
-                for m in ev.progress.milestones:
-                    p_dt = parse_iso_date(m.due_date)
-                    a_dt = parse_iso_date(m.completed_date)
-                    slip_days = (a_dt - p_dt).days if (p_dt and a_dt) else (
-                        (today - p_dt).days if (p_dt and m.status != "Completed" and today > p_dt) else 0
-                    )
-                    timeline_rows.append(
-                        {
-                            "Repository": r,
-                            "Category": "Milestone",
-                            "Event / Milestone": f"[{m.milestone_id}] {m.title}",
-                            "Planned Date": m.due_date or "TBD",
-                            "Actual Date": m.completed_date or ("Pending" if m.status != "Completed" else "Not Recorded"),
-                            "Status": m.status,
-                            "Schedule Variance": f"+{slip_days}d delay" if slip_days > 0 else ("On Time" if p_dt else "-"),
-                            "Delay / Change Notes": f"Weight: {m.weight:.0f}%",
-                            "Evidence": m.evidence_path or "",
-                            "_sort_date": m.due_date or "9999-12-31",
-                        }
-                    )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total Timeline Events", len(ev.timeline))
+            m2.metric("Completed Events", f"{completed_events} / {len(ev.timeline)}")
+            m3.metric("Delayed / Overdue Events", delayed_events)
 
-            if "Review" in cat_filter:
-                for r_num, rev in sorted(ev.reviews.items()):
-                    planned_str = rev.submission_deadline or rev.scheduled_date
-                    p_dt = parse_iso_date(planned_str)
-                    a_dt = parse_iso_date(rev.submitted_at)
-                    slip_days = (a_dt - p_dt).days if (p_dt and a_dt) else 0
-                    timeline_rows.append(
-                        {
-                            "Repository": r,
-                            "Category": "Review",
-                            "Event / Milestone": f"Review {r_num}: {rev.review_name}",
-                            "Planned Date": planned_str or "TBD",
-                            "Actual Date": rev.submitted_at or "Pending",
-                            "Status": rev.submission_status,
-                            "Schedule Variance": f"+{slip_days}d delay" if slip_days > 0 else ("On Time" if p_dt else "-"),
-                            "Delay / Change Notes": "",
-                            "Evidence": f"reviews/review-{r_num}.json",
-                            "_sort_date": planned_str or "9999-12-31",
-                        }
-                    )
-
-            if "Task Deadline" in cat_filter:
-                for t in ev.tasks:
-                    p_dt = parse_iso_date(t.due_date)
-                    a_dt = parse_iso_date(t.completed_date)
-                    slip_days = (a_dt - p_dt).days if (p_dt and a_dt) else (
-                        (today - p_dt).days if (p_dt and t.status != "Completed" and today > p_dt) else 0
-                    )
-                    timeline_rows.append(
-                        {
-                            "Repository": r,
-                            "Category": "Task Deadline",
-                            "Event / Milestone": f"[{t.task_id}] {t.title} ({t.assigned_to})",
-                            "Planned Date": t.due_date or "TBD",
-                            "Actual Date": t.completed_date or ("Pending" if t.status != "Completed" else "Not Recorded"),
-                            "Status": t.status,
-                            "Schedule Variance": f"+{slip_days}d delay" if slip_days > 0 else ("On Time" if p_dt else "-"),
-                            "Delay / Change Notes": f"Priority: {t.priority}",
-                            "Evidence": t.evidence_link or "",
-                            "_sort_date": t.due_date or "9999-12-31",
-                        }
-                    )
-
-        timeline_rows.sort(key=lambda x: (x["_sort_date"], x["Repository"]))
-
-        if not timeline_rows:
-            st.info("No chronological timeline events, milestones, or deadlines have been reported yet.")
-        else:
-            display_df = pd.DataFrame(timeline_rows).drop(columns=["_sort_date"])
-            if len(target_repos) == 1 and "Repository" in display_df.columns:
-                display_df = display_df.drop(columns=["Repository"])
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
-
-            delayed_items = [r for r in timeline_rows if "delay" in str(r["Schedule Variance"])]
-            if delayed_items:
-                st.warning(
-                    f"Schedule Slippage Detected: {len(delayed_items)} milestone(s) or task(s) show a delay relative to planned dates."
-                )
+            st.dataframe(pd.DataFrame(tl_rows), use_container_width=True, hide_index=True)
 
     with tab_edit:
-        edit_repo = (
-            target_repos[0]
-            if len(target_repos) == 1
-            else st.selectbox("Select Repository to Edit Timeline", options=target_repos, key="tl_edit_repo")
+        _render_timeline_editor(
+            selected_repo=selected_repo,
+            ev=ev,
+            user=user,
+            github_client=github_client,
+            local_store=local_store,
         )
-        ev_tl = evaluations[edit_repo]
 
-        if not user.can_edit_repo_metadata(edit_repo):
-            st.info(
-                "Read-Only Mode: Only Team Leads / Owners (`role = \"owner\"` in Secrets) can edit "
-                "`project/timeline.json`. Team members (`role = \"student\"`) have read-only access."
-            )
-        elif github_client is None:
-            st.error("GitHub client is not initialized.")
-        elif not ev_tl.snapshot.accessible:
-            st.error(f"Repository `{edit_repo}` is not accessible.")
-        else:
-            existing_ids = [e.event_id for e in ev_tl.timeline_events]
-            action = st.radio(
-                "Timeline Action",
-                options=["Add or Update Event", "Delete Event"] if existing_ids else ["Add or Update Event"],
-                horizontal=True,
-                key=f"tl_action_{edit_repo}",
-            )
 
-            if action == "Delete Event" and existing_ids:
-                del_id = st.selectbox(
-                    "Select Event to Delete",
-                    options=existing_ids,
-                    format_func=lambda eid: next((f"{e.event_id}: {e.title} ({e.planned_date or 'TBD'})" for e in ev_tl.timeline_events if e.event_id == eid), eid),
-                )
-                if st.button(f"Delete Event `{del_id}` and Commit to GitHub"):
-                    remaining = [
-                        {
-                            "event_id": e.event_id,
-                            "title": e.title,
-                            "category": e.category,
-                            "planned_date": e.planned_date,
-                            "actual_date": e.actual_date,
-                            "status": e.status,
-                            "delay_reason": e.delay_reason,
-                            "evidence_path": e.evidence_path,
-                        }
-                        for e in ev_tl.timeline_events
-                        if e.event_id != del_id
-                    ]
-                    ok, msg = github_client.commit_structured_json(
-                        repo_name=edit_repo,
-                        file_path="project/timeline.json",
-                        json_payload={"events": remaining},
-                        commit_message=f"chore(timeline): delete event {del_id} by {user.username}",
-                        branch=ev_tl.snapshot.default_branch,
-                    )
-                    if local_store:
-                        local_store.log_audit_event(user.username, user.role.value, "delete_timeline_event", edit_repo, msg)
-                    if ok:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
+def _render_timeline_editor(
+    selected_repo: str,
+    ev: TeamEvaluationSummary,
+    user: AuthenticatedUser,
+    github_client: GitHubCohortClient | None,
+    local_store: MentorLocalStore | None,
+) -> None:
+    if not user.can_edit_repo_metadata(selected_repo):
+        st.info(
+            f"Signed in as `{user.username}` (`role = \"{user.role.value}\"`). "
+            "You have **read-only** access. Only Team Leads (`role = \"owner\"` in Secrets) "
+            "can add or edit events in `project/timeline.json`."
+        )
+        return
+
+    if github_client is None or not github_client.auth.is_configured:
+        st.warning("Configure a GitHub token (`[github].token`) in Secrets to commit timeline changes.")
+        return
+
+    st.caption(
+        f"Team Lead Write Mode (`role = \"owner\"`): Add, update, or remove events in `project/timeline.json` for `{selected_repo}`."
+    )
+
+    existing_events = [
+        {
+            "event_id": e.event_id,
+            "title": e.title,
+            "event_type": e.event_type,
+            "planned_date": e.planned_date,
+            "actual_date": e.actual_date,
+            "status": e.status,
+            "description": e.description,
+            "owner": e.owner,
+        }
+        for e in ev.timeline
+    ]
+    existing_ids = [e["event_id"] for e in existing_events]
+
+    action_options = ["Add New Event"]
+    if existing_ids:
+        action_options.extend(["Update Existing Event", "Delete Event"])
+
+    mode = st.radio(
+        "Event Action",
+        options=action_options,
+        horizontal=True,
+        key=f"tl_mode_{selected_repo}",
+    )
+
+    if mode == "Delete Event" and existing_ids:
+        del_id = st.selectbox(
+            "Select Event to Delete",
+            options=existing_ids,
+            format_func=lambda eid: next(
+                (f"{e['event_id']}: {e['title']} ({e['planned_date'] or 'No date'})" for e in existing_events if e["event_id"] == eid),
+                eid,
+            ),
+        )
+        if st.button(f"Delete Event `{del_id}` & Commit to GitHub"):
+            updated_list = [e for e in existing_events if e["event_id"] != del_id]
+            ok, msg = github_client.commit_structured_json(
+                repo_name=selected_repo,
+                file_path="project/timeline.json",
+                json_payload={"events": updated_list},
+                commit_message=f"chore(timeline): delete event {del_id} by {user.username}",
+                branch=ev.snapshot.default_branch,
+            )
+            if local_store:
+                local_store.log_audit_event(user.username, user.role.value, "delete_timeline_event", selected_repo, msg)
+            if ok:
+                st.success(msg)
+                st.rerun()
             else:
-                sel_ev = None
-                if existing_ids:
-                    pick = st.selectbox(
-                        "Select Existing Event to Edit (or '+ New Timeline Event')",
-                        options=["+ New Timeline Event"] + existing_ids,
-                        format_func=lambda x: x if x.startswith("+") else next((f"{e.event_id}: {e.title}" for e in ev_tl.timeline_events if e.event_id == x), x),
-                    )
-                    if not pick.startswith("+"):
-                        sel_ev = next((e for e in ev_tl.timeline_events if e.event_id == pick), None)
+                st.error(msg)
+        return
 
-                default_eid = sel_ev.event_id if sel_ev else f"EV-{len(ev_tl.timeline_events) + 1}"
-                with st.form(f"form_edit_timeline_{edit_repo}"):
-                    c1, c2, c3 = st.columns([1, 2.5, 1.2])
-                    e_id = c1.text_input("Event ID", value=default_eid)
-                    e_title = c2.text_input("Event / Milestone Title", value=sel_ev.title if sel_ev else "")
-                    e_cat = c3.selectbox(
-                        "Category",
-                        options=list(TIMELINE_CATEGORIES),
-                        index=list(TIMELINE_CATEGORIES).index(sel_ev.category) if sel_ev and sel_ev.category in TIMELINE_CATEGORIES else 0,
-                    )
+    sel_event = None
+    if mode == "Update Existing Event" and existing_ids:
+        chosen_id = st.selectbox(
+            "Select Event to Edit",
+            options=existing_ids,
+            format_func=lambda eid: next(
+                (f"{e['event_id']}: {e['title']} ({e['status']})" for e in existing_events if e["event_id"] == eid),
+                eid,
+            ),
+        )
+        sel_event = next((e for e in existing_events if e["event_id"] == chosen_id), None)
 
-                    c4, c5, c6 = st.columns(3)
-                    e_planned = c4.text_input("Planned Date (YYYY-MM-DD)", value=sel_ev.planned_date or "" if sel_ev else "")
-                    e_actual = c5.text_input("Actual Date (YYYY-MM-DD, Optional)", value=sel_ev.actual_date or "" if sel_ev else "")
-                    e_status = c6.selectbox(
-                        "Status",
-                        options=list(VALID_TASK_STATUSES),
-                        index=list(VALID_TASK_STATUSES).index(sel_ev.status) if sel_ev and sel_ev.status in VALID_TASK_STATUSES else 0,
-                    )
+    default_id = sel_event["event_id"] if sel_event else f"E{len(existing_events) + 1}"
 
-                    c7, c8 = st.columns(2)
-                    e_delay = c7.text_input("Delay / Schedule Change Reason (Optional)", value=sel_ev.delay_reason or "" if sel_ev else "")
-                    e_ev = c8.text_input("Evidence Path in Repo", value=sel_ev.evidence_path or "" if sel_ev else "")
+    with st.form(f"tl_editor_form_{selected_repo}"):
+        c1, c2, c3 = st.columns([1, 2.5, 1.2])
+        e_id = c1.text_input("Event ID", value=default_id)
+        e_title = c2.text_input(
+            "Event / Milestone Title",
+            value=sel_event["title"] if sel_event else "",
+            placeholder="e.g., Complete Architecture Specification",
+        )
+        e_type = c3.selectbox(
+            "Event Type",
+            options=list(VALID_TIMELINE_TYPES),
+            index=(
+                list(VALID_TIMELINE_TYPES).index(sel_event["event_type"])
+                if sel_event and sel_event["event_type"] in VALID_TIMELINE_TYPES
+                else 0
+            ),
+        )
 
-                    if st.form_submit_button(f"Commit Event to `project/timeline.json` in `{edit_repo}`"):
-                        if not e_id.strip() or not e_title.strip():
-                            st.error("Event ID and Title are required.")
-                        else:
-                            new_ev = {
-                                "event_id": e_id.strip(),
-                                "title": e_title.strip(),
-                                "category": e_cat,
-                                "planned_date": e_planned.strip() or None,
-                                "actual_date": e_actual.strip() or None,
-                                "status": e_status,
-                                "delay_reason": e_delay.strip() or None,
-                                "evidence_path": e_ev.strip() or None,
-                            }
-                            updated_evs = []
-                            replaced = False
-                            for item in ev_tl.timeline_events:
-                                if item.event_id == e_id.strip():
-                                    updated_evs.append(new_ev)
-                                    replaced = True
-                                else:
-                                    updated_evs.append(
-                                        {
-                                            "event_id": item.event_id,
-                                            "title": item.title,
-                                            "category": item.category,
-                                            "planned_date": item.planned_date,
-                                            "actual_date": item.actual_date,
-                                            "status": item.status,
-                                            "delay_reason": item.delay_reason,
-                                            "evidence_path": item.evidence_path,
-                                        }
-                                    )
-                            if not replaced:
-                                updated_evs.append(new_ev)
+        c4, c5, c6, c7 = st.columns(4)
+        e_planned = c4.text_input(
+            "Planned Date (YYYY-MM-DD)",
+            value=sel_event.get("planned_date") or "" if sel_event else "",
+            placeholder="2026-10-15",
+        )
+        e_actual = c5.text_input(
+            "Actual Date (YYYY-MM-DD)",
+            value=sel_event.get("actual_date") or "" if sel_event else "",
+            placeholder="Leave blank if pending",
+        )
+        e_status = c6.selectbox(
+            "Status",
+            options=list(VALID_TASK_STATUSES),
+            index=(
+                list(VALID_TASK_STATUSES).index(sel_event["status"])
+                if sel_event and sel_event["status"] in VALID_TASK_STATUSES
+                else 0
+            ),
+        )
+        e_owner = c7.text_input(
+            "Owner / Lead",
+            value=sel_event.get("owner") or "" if sel_event else "",
+            placeholder="e.g., All Members",
+        )
 
-                            ok, msg = github_client.commit_structured_json(
-                                repo_name=edit_repo,
-                                file_path="project/timeline.json",
-                                json_payload={"events": updated_evs},
-                                commit_message=f"chore(timeline): update event {e_id.strip()} in project/timeline.json by {user.username}",
-                                branch=ev_tl.snapshot.default_branch,
-                            )
-                            if local_store:
-                                local_store.log_audit_event(user.username, user.role.value, "commit_timeline_json", edit_repo, msg)
-                            if ok:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
+        e_desc = st.text_area(
+            "Description / Notes",
+            value=sel_event.get("description") or "" if sel_event else "",
+            height=68,
+        )
+
+        if st.form_submit_button("Commit Timeline to `project/timeline.json` on GitHub"):
+            if not e_id.strip() or not e_title.strip():
+                st.error("Event ID and Title are required.")
+            else:
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                actual_val = e_actual.strip() or (today_str if e_status == "Completed" else None)
+                new_ev = {
+                    "event_id": e_id.strip(),
+                    "title": e_title.strip(),
+                    "event_type": e_type,
+                    "planned_date": e_planned.strip() or None,
+                    "actual_date": actual_val,
+                    "status": e_status,
+                    "description": e_desc.strip(),
+                    "owner": e_owner.strip(),
+                }
+                updated_list: List[Dict] = []
+                replaced = False
+                for item in existing_events:
+                    if item["event_id"] == e_id.strip():
+                        updated_list.append(new_ev)
+                        replaced = True
+                    else:
+                        updated_list.append(item)
+                if not replaced:
+                    updated_list.append(new_ev)
+
+                ok, msg = github_client.commit_structured_json(
+                    repo_name=selected_repo,
+                    file_path="project/timeline.json",
+                    json_payload={"events": updated_list},
+                    commit_message=f"chore(timeline): update event {e_id.strip()} by {user.username}",
+                    branch=ev.snapshot.default_branch,
+                )
+                if local_store:
+                    local_store.log_audit_event(user.username, user.role.value, "commit_timeline_json", selected_repo, msg)
+                if ok:
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.error(msg)

@@ -1,280 +1,298 @@
 """
-Overall Mentor Dashboard & All-Teams Cohort Comparison View.
+Cohort & Team Overview View (`src/views/overview.py`).
 
-Organized into clean, emoji-free tabs so the mentor or team lead sees high-level KPIs
-immediately and can switch smoothly between Team Cards, Comparison Matrix, Progress Charts,
-and Alerts without visual clutter.
+Organized into four clean, consistent tabs:
+1. `Team Cards`: Scannable status cards with quick workspace navigation.
+2. `Comparison Matrix`: Searchable, filterable cohort-wide status table.
+3. `Progress Charts`: Dual Reported vs. Verified progress and task breakdown charts.
+4. `Alerts & Warnings`: Prioritized governance alerts and JSON validation diagnostics.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from src.analytics import AlertItem, TeamEvaluationSummary
+from src.analytics import TeamEvaluationSummary
 from src.config import DashboardConfig
+from src.ui_theme import format_health_badge
 
 
 def render_overview_page(
     evaluations: Dict[str, TeamEvaluationSummary],
     config: DashboardConfig,
 ) -> None:
-    """Render the clean, emoji-free Executive Overview."""
-    st.markdown("## Executive Overview")
+    """Render the Cohort / Team Overview page."""
+    is_single = len(evaluations) == 1
+    st.markdown("## Team Overview & Health Summary" if is_single else "## Cohort Overview & Team Comparison")
     st.caption(
-        f"Organization: `{config.github_org}` | Project completion is calculated strictly from "
-        "reported tasks and milestones (kept separate from GitHub commit activity)."
+        "Real-time repository health, reported vs. verified progress, and automated governance checks."
     )
 
-    total_teams = len(evaluations)
-    accessible_teams = sum(1 for e in evaluations.values() if e.snapshot.accessible)
-    on_track_teams = sum(1 for e in evaluations.values() if e.attention_level == "On Track")
-    needs_attention_teams = sum(
-        1 for e in evaluations.values() if e.attention_level in ("Needs Attention", "Critical / Blocked")
+    if not evaluations:
+        st.info("No authorized team repositories available.")
+        return
+
+    accessible_evals = [ev for ev in evaluations.values() if ev.snapshot.accessible]
+    on_track_count = sum(1 for ev in accessible_evals if ev.health_status == "On Track")
+    avg_verified = (
+        round(sum(ev.verified_progress_pct for ev in accessible_evals) / len(accessible_evals), 1)
+        if accessible_evals
+        else 0.0
     )
-    total_overdue_tasks = sum(e.task_metrics.overdue_tasks for e in evaluations.values())
-    total_unresolved_ais = sum(len(e.unresolved_action_items) for e in evaluations.values())
+    total_open_tasks = sum(max(0, ev.total_tasks - ev.completed_tasks) for ev in accessible_evals)
+    total_alerts = sum(len(ev.alerts) for ev in evaluations.values())
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Teams", total_teams)
-    col2.metric("Connected", f"{accessible_teams}/{total_teams}")
-    col3.metric("On Track", on_track_teams)
-    col4.metric("Need Attention", needs_attention_teams)
-    col5.metric("Overdue Tasks", total_overdue_tasks)
-    col6.metric("Open Action Items", total_unresolved_ais)
-
-    with st.expander("Search, Filter & Sort Teams", expanded=False):
-        f_col1, f_col2, f_col3 = st.columns([2, 1.5, 1.5])
-        with f_col1:
-            search_query = st.text_input(
-                "Search by team name, domain, or problem statement",
-                value="",
-                placeholder="e.g., Healthcare, pbl-team-14, Smart Grid...",
-            ).strip().lower()
-        with f_col2:
-            status_filter = st.multiselect(
-                "Attention Status",
-                options=["On Track", "Needs Attention", "Critical / Blocked", "Unavailable"],
-                default=["On Track", "Needs Attention", "Critical / Blocked", "Unavailable"],
-            )
-        with f_col3:
-            sort_by = st.selectbox(
-                "Sort Teams By",
-                options=[
-                    "Repository Name",
-                    "Attention Priority",
-                    "Reported Progress (High to Low)",
-                    "Overdue Tasks (High to Low)",
-                ],
-            )
-
-    rows: List[Dict] = []
-    filtered_evals: List[TeamEvaluationSummary] = []
-
-    for repo_name, ev in evaluations.items():
-        if ev.attention_level not in status_filter:
-            continue
-        team_name = ev.metadata.team_name if ev.metadata else repo_name
-        domain = ev.metadata.domain if ev.metadata else "Not Reported"
-        title = ev.metadata.project_title if ev.metadata else "Not Reported"
-        prob = ev.metadata.problem_statement if ev.metadata else ""
-
-        if search_query:
-            haystack = f"{repo_name} {team_name} {domain} {title} {prob}".lower()
-            if search_query not in haystack:
-                continue
-
-        filtered_evals.append(ev)
-
-        last_commit_str = (
-            ev.snapshot.recent_commits[0].committed_date[:10]
-            if ev.snapshot.recent_commits
-            else (ev.snapshot.pushed_at[:10] if ev.snapshot.pushed_at else "No Commits")
-        )
-        rows.append(
-            {
-                "Repository": repo_name,
-                "Team Name": team_name,
-                "Domain": domain,
-                "Project Title": title,
-                "Attention Status": ev.attention_level,
-                "Progress Status": ev.progress_display_status,
-                "Reported Task %": (
-                    f"{ev.task_metrics.reported_completion_pct:.1f}%"
-                    if ev.task_metrics.reported_completion_pct is not None
-                    else "Not Reported"
-                ),
-                "Verified Evidence %": (
-                    f"{ev.task_metrics.verified_completion_pct:.1f}%"
-                    if ev.task_metrics.verified_completion_pct is not None
-                    else "Not Reported"
-                ),
-                "Milestones (Done/Total)": (
-                    f"{ev.milestone_metrics.completed_milestones}/{ev.milestone_metrics.total_milestones}"
-                    if ev.milestone_metrics.status_label == "Reported"
-                    else ev.milestone_metrics.status_label
-                ),
-                "Overdue Tasks": ev.task_metrics.overdue_tasks if ev.snapshot.accessible else "-",
-                "Blocked Tasks": ev.task_metrics.blocked_tasks if ev.snapshot.accessible else "-",
-                "Current Review": ev.current_review_label,
-                "Open Action Items": len(ev.unresolved_action_items) if ev.snapshot.accessible else "-",
-                "Last Progress Report": ev.last_reported_date or "Not Reported",
-                "Last GitHub Push (Separate)": last_commit_str if ev.snapshot.accessible else "Unavailable",
-                "GitHub URL": ev.snapshot.html_url,
-                "_sort_progress": ev.hybrid_progress_pct if ev.hybrid_progress_pct is not None else -1.0,
-                "_sort_overdue": ev.task_metrics.overdue_tasks,
-                "_sort_attention": {
-                    "Critical / Blocked": 0,
-                    "Unavailable": 1,
-                    "Needs Attention": 2,
-                    "On Track": 3,
-                }.get(ev.attention_level, 4),
-            }
-        )
-
-    if sort_by == "Attention Priority":
-        rows.sort(key=lambda r: (r["_sort_attention"], r["Repository"]))
-    elif sort_by == "Reported Progress (High to Low)":
-        rows.sort(key=lambda r: r["_sort_progress"], reverse=True)
-    elif sort_by == "Overdue Tasks (High to Low)":
-        rows.sort(key=lambda r: r["_sort_overdue"], reverse=True)
-    else:
-        rows.sort(key=lambda r: r["Repository"])
-
-    all_alerts: List[AlertItem] = []
-    for ev in filtered_evals:
-        all_alerts.extend(ev.alerts)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Connected Repositories", f"{len(accessible_evals)} / {len(evaluations)}")
+    k2.metric("Teams On Track", f"{on_track_count} / {len(evaluations)}")
+    k3.metric("Avg Verified Progress", f"{avg_verified:.1f}%")
+    k4.metric("Active Alerts / Open Tasks", f"{total_alerts} alerts · {total_open_tasks} tasks")
 
     tab_cards, tab_matrix, tab_charts, tab_alerts = st.tabs(
         [
-            f"Team Cards ({len(filtered_evals)})",
+            "Team Cards",
             "Comparison Matrix",
             "Progress Charts",
-            f"Alerts & Warnings ({len(all_alerts)})",
+            "Alerts & Validation",
         ]
     )
 
+    # ------------------------------------------------------------------
+    # Tab 1: Team Cards
+    # ------------------------------------------------------------------
     with tab_cards:
-        if not filtered_evals:
-            st.info("No teams match the current filter criteria.")
-        else:
-            card_cols = st.columns(3)
-            for idx, ev in enumerate(filtered_evals):
-                with card_cols[idx % 3]:
+        cols_per_row = 1 if is_single else 2
+        repo_names = list(evaluations.keys())
+        for i in range(0, len(repo_names), cols_per_row):
+            row_cols = st.columns(cols_per_row)
+            for col_idx, repo_name in enumerate(repo_names[i : i + cols_per_row]):
+                ev = evaluations[repo_name]
+                with row_cols[col_idx]:
                     with st.container(border=True):
-                        t_name = ev.metadata.team_name if ev.metadata else ev.repo_name
-                        st.markdown(f"**{t_name}** (`{ev.repo_name}`)")
-                        st.caption(
-                            f"Status: **{ev.attention_level}** | "
-                            f"{ev.metadata.domain if ev.metadata else 'Domain Not Reported'}"
-                        )
-                        if ev.hybrid_progress_pct is not None:
-                            st.progress(
-                                min(1.0, max(0.0, ev.hybrid_progress_pct / 100.0)),
-                                text=f"Progress: {ev.hybrid_progress_pct:.1f}%",
+                        h_col1, h_col2 = st.columns([2.2, 1])
+                        with h_col1:
+                            st.markdown(f"#### {ev.display_team_name}")
+                            project_title = (
+                                ev.metadata.project_title
+                                if ev.metadata and ev.metadata.project_title
+                                else "Project Title Not Set"
                             )
-                        else:
-                            st.progress(0.0, text=f"Progress: {ev.progress_display_status}")
+                            domain_label = (
+                                ev.metadata.domain
+                                if ev.metadata and ev.metadata.domain
+                                else "General Engineering & Innovation"
+                            )
+                            st.caption(f"`{repo_name}` · {domain_label} · {project_title}")
+                        with h_col2:
+                            st.markdown(
+                                f"<div style='text-align:right; font-weight:600; padding-top:4px;'>"
+                                f"{format_health_badge(ev.health_status)}</div>",
+                                unsafe_allow_html=True,
+                            )
 
-                        c_a, c_b = st.columns(2)
-                        c_a.caption(f"Review: **{ev.current_review_label}**")
-                        c_b.caption(
-                            f"Tasks: **{ev.task_metrics.completed_tasks}/{ev.task_metrics.total_tasks}** "
-                            f"({ev.task_metrics.overdue_tasks} overdue)"
+                        if not ev.snapshot.accessible:
+                            st.error(ev.snapshot.error_message or "Repository inaccessible.")
+                            continue
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Verified", f"{ev.verified_progress_pct:.0f}%")
+                        m2.metric("Reported", f"{ev.reported_progress_pct:.0f}%")
+                        m3.metric("Tasks Done", f"{ev.completed_tasks}/{ev.total_tasks}")
+                        m4.metric(
+                            "Last Commit",
+                            f"{ev.days_since_last_commit}d ago"
+                            if ev.days_since_last_commit is not None
+                            else "N/A",
                         )
 
-                        b1, b2, b3 = st.columns(3)
-                        if b1.button("Workspace", key=f"nav_ws_{ev.repo_name}", use_container_width=True):
-                            st.session_state["selected_repo"] = ev.repo_name
-                            nav_opts = st.session_state.get("_nav_options", [])
-                            st.session_state["active_page"] = (
-                                "Individual Team Workspace"
-                                if "Individual Team Workspace" in nav_opts
-                                else "Team Workspace & Profile"
-                            )
-                            st.rerun()
-                        if b2.button("Files", key=f"nav_ex_{ev.repo_name}", use_container_width=True):
-                            st.session_state["selected_repo"] = ev.repo_name
-                            st.session_state["active_page"] = "Repository Explorer"
-                            st.rerun()
-                        b3.link_button("GitHub", ev.snapshot.html_url, use_container_width=True)
+                        st.progress(
+                            min(1.0, max(0.0, ev.verified_progress_pct / 100.0)),
+                            text=f"Verified Completion: {ev.verified_progress_pct:.1f}%",
+                        )
 
+                        b_col1, b_col2 = st.columns([1.4, 1])
+                        with b_col1:
+                            phase_str = ev.progress.current_phase if ev.progress else "Phase Not Reported"
+                            st.caption(f"Phase: **{phase_str}** · Members: **{len(ev.members)}**")
+                        with b_col2:
+                            if st.button(
+                                f"Open {repo_name}",
+                                key=f"open_ws_{repo_name}",
+                                use_container_width=True,
+                            ):
+                                st.session_state["selected_repo"] = repo_name
+                                nav_opts = st.session_state.get("_nav_options", [])
+                                for target_page in (
+                                    "Team Workspace & Profile",
+                                    "Individual Team Workspace",
+                                ):
+                                    if target_page in nav_opts:
+                                        st.session_state["active_page"] = target_page
+                                        st.rerun()
+
+    # ------------------------------------------------------------------
+    # Tab 2: Comparison Matrix
+    # ------------------------------------------------------------------
     with tab_matrix:
-        st.caption(
-            "Side-by-side comparison of reported progress, verified repository evidence, milestones, "
-            "and separate GitHub push dates."
-        )
-        if rows:
-            display_df = pd.DataFrame(rows).drop(
-                columns=["_sort_progress", "_sort_overdue", "_sort_attention"]
+        rows = []
+        for repo_name, ev in evaluations.items():
+            rows.append(
+                {
+                    "Repository": repo_name,
+                    "Team Name": ev.display_team_name,
+                    "Domain": ev.metadata.domain if ev.metadata else "Not Specified",
+                    "Health": format_health_badge(ev.health_status),
+                    "Verified (%)": ev.verified_progress_pct,
+                    "Reported (%)": ev.reported_progress_pct,
+                    "Discrepancy (%)": ev.progress_discrepancy_pct,
+                    "Tasks (Done/Total)": f"{ev.completed_tasks}/{ev.total_tasks}",
+                    "Overdue Tasks": len(ev.overdue_tasks),
+                    "Blocked Tasks": ev.blocked_tasks,
+                    "Open Action Items": len(ev.unresolved_action_items),
+                    "Last Commit (Days)": (
+                        ev.days_since_last_commit if ev.days_since_last_commit is not None else "-"
+                    ),
+                }
             )
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "GitHub URL": st.column_config.LinkColumn("GitHub Repo", display_text="Open Repo"),
-                },
-            )
-        else:
-            st.info("No teams match the current filter criteria.")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+    # ------------------------------------------------------------------
+    # Tab 3: Progress Charts
+    # ------------------------------------------------------------------
     with tab_charts:
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            st.markdown("##### Reported vs. Evidence-Verified Task Completion (%)")
-            chart_rows = [
-                {
-                    "Team": ev.repo_name,
-                    "Reported Completion %": ev.task_metrics.reported_completion_pct,
-                    "Evidence-Verified %": ev.task_metrics.verified_completion_pct or 0.0,
-                }
-                for ev in filtered_evals
-                if ev.snapshot.accessible and ev.task_metrics.reported_completion_pct is not None
-            ]
-            if chart_rows:
-                st.bar_chart(pd.DataFrame(chart_rows).set_index("Team"))
-            else:
-                st.info("No structured task completion percentages reported yet.")
-
-        with chart_col2:
-            st.markdown("##### Task Status Breakdown by Team")
-            status_rows = [
-                {
-                    "Team": ev.repo_name,
-                    "Completed": ev.task_metrics.completed_tasks,
-                    "In Progress": ev.task_metrics.in_progress_tasks,
-                    "Blocked": ev.task_metrics.blocked_tasks,
-                    "Not Started": ev.task_metrics.not_started_tasks,
-                }
-                for ev in filtered_evals
-                if ev.snapshot.accessible and ev.task_metrics.total_tasks > 0
-            ]
-            if status_rows:
-                st.bar_chart(pd.DataFrame(status_rows).set_index("Team"))
-            else:
-                st.info("No structured `tasks/tasks.json` records available to chart.")
-
-    with tab_alerts:
-        if not all_alerts:
-            st.success("No active alerts across the selected teams.")
+        if not accessible_evals:
+            st.info("No accessible repositories available to chart.")
         else:
-            sev_filter = st.radio(
-                "Filter alerts by severity",
-                options=["All", "Critical Only", "Warnings & Critical"],
-                horizontal=True,
-            )
-            for alert in all_alerts:
-                if sev_filter == "Critical Only" and alert.severity != "critical":
-                    continue
-                if sev_filter == "Warnings & Critical" and alert.severity not in ("critical", "warning"):
-                    continue
-                prefix = f"**[{alert.repo_name} | {alert.category}]** {alert.message}"
-                if alert.severity == "critical":
-                    st.error(prefix)
-                elif alert.severity == "warning":
-                    st.warning(prefix)
-                else:
-                    st.info(prefix)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("#### Reported vs. Verified Progress (%)")
+                chart_df = pd.DataFrame(
+                    [
+                        {
+                            "Team": ev.display_team_name,
+                            "Reported Progress (%)": ev.reported_progress_pct,
+                            "Verified Progress (%)": ev.verified_progress_pct,
+                        }
+                        for ev in accessible_evals
+                    ]
+                )
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        x=chart_df["Team"],
+                        y=chart_df["Reported Progress (%)"],
+                        name="Reported (%)",
+                        marker_color="#64748B",
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        x=chart_df["Team"],
+                        y=chart_df["Verified Progress (%)"],
+                        name="Verified (%)",
+                        marker_color="#2563EB",
+                    )
+                )
+                fig.update_layout(
+                    barmode="group",
+                    yaxis=dict(range=[0, 105], title="Completion (%)"),
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    height=340,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            with c2:
+                st.markdown("#### Task Status Distribution")
+                task_rows = []
+                for ev in accessible_evals:
+                    not_started = max(
+                        0,
+                        ev.total_tasks
+                        - ev.completed_tasks
+                        - ev.in_progress_tasks
+                        - ev.blocked_tasks
+                        - ev.delayed_tasks,
+                    )
+                    for status_label, count_val in [
+                        ("Completed", ev.completed_tasks),
+                        ("In Progress", ev.in_progress_tasks),
+                        ("Blocked", ev.blocked_tasks),
+                        ("Delayed", ev.delayed_tasks),
+                        ("Not Started", not_started),
+                    ]:
+                        task_rows.append(
+                            {
+                                "Team": ev.display_team_name,
+                                "Status": status_label,
+                                "Tasks": count_val,
+                            }
+                        )
+                t_df = pd.DataFrame(task_rows)
+                fig2 = px.bar(
+                    t_df,
+                    x="Team",
+                    y="Tasks",
+                    color="Status",
+                    barmode="stack",
+                    color_discrete_map={
+                        "Completed": "#16A34A",
+                        "In Progress": "#2563EB",
+                        "Blocked": "#DC2626",
+                        "Delayed": "#D97706",
+                        "Not Started": "#94A3B8",
+                    },
+                )
+                fig2.update_layout(
+                    margin=dict(l=20, r=20, t=20, b=20),
+                    height=340,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # Tab 4: Alerts & Schema Diagnostics
+    # ------------------------------------------------------------------
+    with tab_alerts:
+        alert_rows = []
+        for repo_name, ev in evaluations.items():
+            for a in ev.alerts:
+                sev_badge = (
+                    "🔴 High"
+                    if a.severity == "high"
+                    else ("🟡 Medium" if a.severity == "medium" else "⚪ Low")
+                )
+                alert_rows.append(
+                    {
+                        "Repository": repo_name,
+                        "Team": ev.display_team_name,
+                        "Severity": sev_badge,
+                        "Category": a.category,
+                        "Details": a.message,
+                    }
+                )
+        if alert_rows:
+            st.markdown("#### Automated Governance & Freshness Alerts")
+            st.dataframe(pd.DataFrame(alert_rows), use_container_width=True, hide_index=True)
+        else:
+            st.success("✓ All repositories are healthy with no active risk alerts.")
+
+        val_rows = []
+        for repo_name, ev in evaluations.items():
+            for v in ev.validation_issues:
+                val_rows.append(
+                    {
+                        "Repository": repo_name,
+                        "File": v.file_path,
+                        "Level": v.severity.upper(),
+                        "Diagnostic": v.message,
+                    }
+                )
+        if val_rows:
+            with st.expander(f"Metadata & Template Notices ({len(val_rows)})", expanded=False):
+                st.dataframe(pd.DataFrame(val_rows), use_container_width=True, hide_index=True)

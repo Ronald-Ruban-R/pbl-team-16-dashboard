@@ -1,11 +1,11 @@
 """
-Review Management, Submission Editor & Action Item Tracking View.
+Review Management, Submission Editor & Action Item Tracking View (`src/views/reviews.py`).
 
-Organized into four clean tabs:
+Organized into four clean, consistent tabs:
 1. `Deliverables & Action Items`: Inspect a team's review submission, evidence links, and action items.
-2. `Edit Review Submission & Action Items`: Interactive forms for Team Leads (`role = "owner"`) to create or update `reviews/review-N.json` (submission metadata, evidence links, deliverables checklist, and action items) directly on GitHub.
+2. `Edit Review N JSON`: Owner-only interactive forms to create or update `reviews/review-N.json` directly on GitHub.
 3. `Record Mentor Feedback`: Clean evaluation form to save feedback locally in SQLite or commit to GitHub.
-4. `Cohort Review Matrix & History`: Cross-team Review 1–4 progression matrix and consecutive review comparison.
+4. `Review History & Cohort Matrix`: Cross-team Review 1–4 progression matrix and consecutive review comparison.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from src.config import DashboardConfig, ReviewDefinition
 from src.github_client import GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser
 from src.storage import MentorLocalStore
+from src.ui_theme import format_bool_indicator, format_task_status
 from src.validators import (
     VALID_SUBMISSION_STATUSES,
     VALID_TASK_STATUSES,
@@ -36,7 +37,7 @@ def render_reviews_page(
     access_manager: AccessControlManager,
     local_store: MentorLocalStore,
 ) -> None:
-    """Render the clean, tab-organized Review Management and JSON Editor view."""
+    """Render the Review Management and JSON Editor view."""
     st.markdown("## Review Management & Action-Item Tracker")
     st.caption(
         "Inspect Review 1–4 deliverables, verify evidence in the repository, update review submissions, "
@@ -53,7 +54,12 @@ def render_reviews_page(
         selected_repo = (
             authorized_repos[0]
             if len(authorized_repos) == 1
-            else st.selectbox("Select Team", options=authorized_repos, key="rev_team_select")
+            else st.selectbox(
+                "Select Team",
+                options=authorized_repos,
+                format_func=lambda r: f"{r} — {evaluations[r].display_team_name}",
+                key="rev_team_select",
+            )
         )
     access_manager.authorize_repo_access(user, selected_repo)
     ev = evaluations[selected_repo]
@@ -101,12 +107,12 @@ def render_reviews_page(
                     {
                         "Deliverable": d.title,
                         "Required": "Yes" if d.required else "Optional",
-                        "Submitted": "Yes" if d.submitted else "No",
+                        "Submitted": format_bool_indicator(d.submitted, "Submitted", "No"),
                         "Artifact Path": d.artifact_path or "-",
-                        "Verified in Repo": (
-                            "Found"
-                            if is_evidence_verified_in_repo(d.artifact_path, repo_paths_lower)
-                            else "Missing"
+                        "Verified in Repo": format_bool_indicator(
+                            is_evidence_verified_in_repo(d.artifact_path, repo_paths_lower),
+                            "Verified",
+                            "Missing",
                         ),
                         "Notes": d.notes or "",
                     }
@@ -143,7 +149,7 @@ def render_reviews_page(
                             "Action Item": ai.description,
                             "Assignee": ai.assigned_to,
                             "Due": ai.due_date or "-",
-                            "Status": ai.status,
+                            "Status": format_task_status(ai.status),
                             "Evidence": ai.resolution_evidence or "-",
                         }
                         for ai in repo_rev.action_items
@@ -233,7 +239,9 @@ def render_reviews_page(
                 sc1, sc2, sc3 = st.columns(3)
                 strengths_val = sc1.text_area("Strengths (1 per line)", value=initial_strengths, height=95)
                 concerns_val = sc2.text_area("Concerns (1 per line)", value=initial_concerns, height=95)
-                improvements_val = sc3.text_area("Improvement Areas (1 per line)", value=initial_improvements, height=95)
+                improvements_val = sc3.text_area(
+                    "Improvement Areas (1 per line)", value=initial_improvements, height=95
+                )
 
                 commit_to_gh = False
                 if config.enable_github_writeback:
@@ -255,39 +263,12 @@ def render_reviews_page(
                     existing_scores = (
                         saved_draft["criteria_scores"]
                         if saved_draft
-                        else (
-                            [
-                                {
-                                    "criterion": c.criterion,
-                                    "max_score": c.max_score,
-                                    "awarded_score": c.awarded_score,
-                                    "comments": c.comments,
-                                }
-                                for c in repo_rev.criteria_scores
-                            ]
-                            if repo_rev
-                            else []
-                        )
+                        else _default_scores_list(repo_rev)
                     )
                     existing_ais = (
                         saved_draft["action_items"]
                         if saved_draft
-                        else (
-                            [
-                                {
-                                    "action_id": a.action_id,
-                                    "description": a.description,
-                                    "assigned_to": a.assigned_to,
-                                    "due_date": a.due_date,
-                                    "status": a.status,
-                                    "resolution_evidence": a.resolution_evidence,
-                                    "completed_date": a.completed_date,
-                                }
-                                for a in repo_rev.action_items
-                            ]
-                            if repo_rev
-                            else []
-                        )
+                        else _default_action_items_list(repo_rev)
                     )
 
                     saved_ok = local_store.save_feedback_draft(
@@ -343,7 +324,7 @@ def render_reviews_page(
     # Tab 4: Consecutive Review Comparison & Cohort Matrix
     # ------------------------------------------------------------------
     with tab_matrix:
-        st.markdown(f"#### Consecutive Review Comparison for `{selected_repo}`")
+        st.markdown(f"#### Consecutive Review Comparison for {ev.display_team_name}")
         comp_rows = []
         for r_num in review_numbers:
             r_obj = ev.reviews.get(r_num)
@@ -361,7 +342,7 @@ def render_reviews_page(
                         "Deliverables Submitted": f"{sum(1 for d in r_obj.deliverables if d.submitted)}/{len(r_obj.deliverables)}",
                         "Score": f"{awarded:.1f} / {max_pts:.1f}" if max_pts > 0 else "Not Scored",
                         "Action Items (Resolved/Total)": f"{done_ais}/{open_ais + done_ais}",
-                        "Mentor Feedback": "Recorded" if r_obj.mentor_feedback else "None",
+                        "Mentor Feedback": "✓ Recorded" if r_obj.mentor_feedback else "None",
                     }
                 )
             else:
@@ -386,7 +367,7 @@ def render_reviews_page(
                 ev_item = evaluations[r]
                 row: Dict[str, Any] = {
                     "Repository": r,
-                    "Team Name": ev_item.metadata.team_name if ev_item.metadata else r,
+                    "Team Name": ev_item.display_team_name,
                 }
                 for rev_def_item in config.reviews:
                     rev_rec = ev_item.reviews.get(rev_def_item.review_number)
@@ -399,7 +380,9 @@ def render_reviews_page(
                         row[f"Review {rev_def_item.review_number}"] = f"Draft ({draft['submission_status']})"
                     else:
                         row[f"Review {rev_def_item.review_number}"] = "Not Reported"
-                row["Open Action Items"] = len(ev_item.unresolved_action_items) if ev_item.snapshot.accessible else "-"
+                row["Open Action Items"] = (
+                    len(ev_item.unresolved_action_items) if ev_item.snapshot.accessible else "-"
+                )
                 matrix_rows.append(row)
             st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
 
@@ -495,18 +478,66 @@ def _build_review_payload(
                 else (rev_def.title if rev_def else f"Review {selected_rev_num}")
             )
         ),
-        "scheduled_date": scheduled_date if scheduled_date is not None else (repo_rev.scheduled_date if repo_rev else None),
-        "submission_deadline": submission_deadline if submission_deadline is not None else (repo_rev.submission_deadline if repo_rev else None),
-        "submitted_at": submitted_at if submitted_at is not None else (repo_rev.submitted_at if repo_rev else None),
-        "submission_status": submission_status if submission_status is not None else (repo_rev.submission_status if repo_rev else "Not Submitted"),
-        "deliverables": deliverables if deliverables is not None else _default_deliverables_list(repo_rev, rev_def),
-        "evidence_links": evidence_links if evidence_links is not None else (dict(repo_rev.evidence_links) if repo_rev else {}),
-        "mentor_feedback": mentor_feedback if mentor_feedback is not None else (repo_rev.mentor_feedback if repo_rev else ""),
-        "criteria_scores": criteria_scores if criteria_scores is not None else _default_scores_list(repo_rev),
-        "strengths": strengths if strengths is not None else (list(repo_rev.strengths) if repo_rev else []),
-        "concerns": concerns if concerns is not None else (list(repo_rev.concerns) if repo_rev else []),
-        "improvement_areas": improvement_areas if improvement_areas is not None else (list(repo_rev.improvement_areas) if repo_rev else []),
-        "action_items": action_items if action_items is not None else _default_action_items_list(repo_rev),
+        "scheduled_date": (
+            scheduled_date
+            if scheduled_date is not None
+            else (repo_rev.scheduled_date if repo_rev else None)
+        ),
+        "submission_deadline": (
+            submission_deadline
+            if submission_deadline is not None
+            else (repo_rev.submission_deadline if repo_rev else None)
+        ),
+        "submitted_at": (
+            submitted_at
+            if submitted_at is not None
+            else (repo_rev.submitted_at if repo_rev else None)
+        ),
+        "submission_status": (
+            submission_status
+            if submission_status is not None
+            else (repo_rev.submission_status if repo_rev else "Not Submitted")
+        ),
+        "deliverables": (
+            deliverables
+            if deliverables is not None
+            else _default_deliverables_list(repo_rev, rev_def)
+        ),
+        "evidence_links": (
+            evidence_links
+            if evidence_links is not None
+            else (dict(repo_rev.evidence_links) if repo_rev else {})
+        ),
+        "mentor_feedback": (
+            mentor_feedback
+            if mentor_feedback is not None
+            else (repo_rev.mentor_feedback if repo_rev else "")
+        ),
+        "criteria_scores": (
+            criteria_scores
+            if criteria_scores is not None
+            else _default_scores_list(repo_rev)
+        ),
+        "strengths": (
+            strengths
+            if strengths is not None
+            else (list(repo_rev.strengths) if repo_rev else [])
+        ),
+        "concerns": (
+            concerns
+            if concerns is not None
+            else (list(repo_rev.concerns) if repo_rev else [])
+        ),
+        "improvement_areas": (
+            improvement_areas
+            if improvement_areas is not None
+            else (list(repo_rev.improvement_areas) if repo_rev else [])
+        ),
+        "action_items": (
+            action_items
+            if action_items is not None
+            else _default_action_items_list(repo_rev)
+        ),
     }
 
 
@@ -551,13 +582,21 @@ def _render_review_json_editor(
 
     if editor_section.startswith("1."):
         ev_links = dict(repo_rev.evidence_links) if repo_rev and repo_rev.evidence_links else {}
-        init_status = repo_rev.submission_status if repo_rev and repo_rev.submission_status in VALID_SUBMISSION_STATUSES else "Not Submitted"
+        init_status = (
+            repo_rev.submission_status
+            if repo_rev and repo_rev.submission_status in VALID_SUBMISSION_STATUSES
+            else "Not Submitted"
+        )
 
         with st.form(f"rev_meta_form_{selected_repo}_{selected_rev_num}"):
             c1, c2 = st.columns([2, 1])
             r_name = c1.text_input(
                 "Review Title",
-                value=repo_rev.review_name if repo_rev else (rev_def.title if rev_def else f"Review {selected_rev_num}"),
+                value=(
+                    repo_rev.review_name
+                    if repo_rev
+                    else (rev_def.title if rev_def else f"Review {selected_rev_num}")
+                ),
             )
             r_status = c2.selectbox(
                 "Submission Status",
@@ -566,20 +605,46 @@ def _render_review_json_editor(
             )
 
             d1, d2, d3 = st.columns(3)
-            r_sched = d1.text_input("Scheduled Date (YYYY-MM-DD)", value=repo_rev.scheduled_date or "" if repo_rev else "")
-            r_dead = d2.text_input("Submission Deadline (YYYY-MM-DD)", value=repo_rev.submission_deadline or "" if repo_rev else "")
+            r_sched = d1.text_input(
+                "Scheduled Date (YYYY-MM-DD)",
+                value=repo_rev.scheduled_date or "" if repo_rev else "",
+            )
+            r_dead = d2.text_input(
+                "Submission Deadline (YYYY-MM-DD)",
+                value=repo_rev.submission_deadline or "" if repo_rev else "",
+            )
             r_sub_at = d3.text_input(
                 "Submitted Date (YYYY-MM-DD)",
-                value=repo_rev.submitted_at or datetime.now(timezone.utc).strftime("%Y-%m-%d") if repo_rev else "",
+                value=(
+                    repo_rev.submitted_at or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    if repo_rev
+                    else ""
+                ),
             )
 
             st.markdown("**Direct Evidence Links (Repo Paths or URLs)**")
             e1, e2 = st.columns(2)
-            ev_pres = e1.text_input("Presentation Path / URL", value=ev_links.get("presentation", ""), placeholder="deliverables/review1_slides.pdf")
-            ev_rep = e2.text_input("Report Path / URL", value=ev_links.get("report", ""), placeholder="documentation/architecture_spec.md")
+            ev_pres = e1.text_input(
+                "Presentation Path / URL",
+                value=ev_links.get("presentation", ""),
+                placeholder="deliverables/review1_slides.pdf",
+            )
+            ev_rep = e2.text_input(
+                "Report Path / URL",
+                value=ev_links.get("report", ""),
+                placeholder="documentation/architecture_spec.md",
+            )
             e3, e4 = st.columns(2)
-            ev_proto = e3.text_input("Prototype Path / URL", value=ev_links.get("prototype", ""), placeholder="deliverables/prototype_v1/")
-            ev_res = e4.text_input("Research / Dataset Path / URL", value=ev_links.get("research", ""), placeholder="research/literature_review.md")
+            ev_proto = e3.text_input(
+                "Prototype Path / URL",
+                value=ev_links.get("prototype", ""),
+                placeholder="deliverables/prototype_v1/",
+            )
+            ev_res = e4.text_input(
+                "Research / Dataset Path / URL",
+                value=ev_links.get("research", ""),
+                placeholder="research/literature_review.md",
+            )
 
             if st.form_submit_button(f"Save Review {selected_rev_num} Metadata & Evidence Links"):
                 new_links: Dict[str, str] = {}
@@ -625,7 +690,11 @@ def _render_review_json_editor(
             options=titles + ["+ Add New Deliverable"],
             key=f"pick_deliv_{selected_repo}_{selected_rev_num}",
         )
-        sel_d = None if pick_d == "+ Add New Deliverable" else next((d for d in deliv_list if d["title"] == pick_d), None)
+        sel_d = (
+            None
+            if pick_d == "+ Add New Deliverable"
+            else next((d for d in deliv_list if d["title"] == pick_d), None)
+        )
 
         with st.form(f"rev_deliv_form_{selected_repo}_{selected_rev_num}"):
             d_title = st.text_input("Deliverable Title", value=sel_d["title"] if sel_d else "")
@@ -674,7 +743,9 @@ def _render_review_json_editor(
                         commit_message=f"chore(reviews): update deliverable '{d_title.strip()}' in Review {selected_rev_num} by {user.username}",
                         branch=ev.snapshot.default_branch,
                     )
-                    local_store.log_audit_event(user.username, user.role.value, "commit_review_deliverable", selected_repo, msg)
+                    local_store.log_audit_event(
+                        user.username, user.role.value, "commit_review_deliverable", selected_repo, msg
+                    )
                     if ok:
                         st.success(msg)
                         st.rerun()
@@ -686,7 +757,11 @@ def _render_review_json_editor(
         ai_ids = [a["action_id"] for a in ai_list]
         ai_mode = st.radio(
             "Action Item Operation",
-            options=["Add / Update Action Item", "Delete Action Item"] if ai_ids else ["Add / Update Action Item"],
+            options=(
+                ["Add / Update Action Item", "Delete Action Item"]
+                if ai_ids
+                else ["Add / Update Action Item"]
+            ),
             horizontal=True,
             key=f"ai_op_{selected_repo}_{selected_rev_num}",
         )
@@ -718,10 +793,21 @@ def _render_review_json_editor(
         pick_ai = st.selectbox(
             "Select Action Item to Edit (or '+ Add New Action Item')",
             options=ai_ids + ["+ Add New Action Item"],
-            format_func=lambda x: x if x.startswith("+") else next((f"{a['action_id']}: {a['description']} ({a['status']})" for a in ai_list if a["action_id"] == x), x),
+            format_func=lambda x: (
+                x
+                if x.startswith("+")
+                else next(
+                    (f"{a['action_id']}: {a['description']} ({a['status']})" for a in ai_list if a["action_id"] == x),
+                    x,
+                )
+            ),
             key=f"pick_ai_{selected_repo}_{selected_rev_num}",
         )
-        sel_ai = None if pick_ai.startswith("+") else next((a for a in ai_list if a["action_id"] == pick_ai), None)
+        sel_ai = (
+            None
+            if pick_ai.startswith("+")
+            else next((a for a in ai_list if a["action_id"] == pick_ai), None)
+        )
 
         with st.form(f"rev_ai_form_{selected_repo}_{selected_rev_num}"):
             c1, c2, c3 = st.columns([1, 1.5, 1.2])
@@ -733,7 +819,11 @@ def _render_review_json_editor(
             a_status = c3.selectbox(
                 "Status",
                 options=list(VALID_TASK_STATUSES),
-                index=list(VALID_TASK_STATUSES).index(sel_ai["status"]) if sel_ai and sel_ai["status"] in VALID_TASK_STATUSES else 0,
+                index=(
+                    list(VALID_TASK_STATUSES).index(sel_ai["status"])
+                    if sel_ai and sel_ai["status"] in VALID_TASK_STATUSES
+                    else 0
+                ),
             )
             a_desc = st.text_input("Action Item Description", value=sel_ai["description"] if sel_ai else "")
             c4, c5 = st.columns([1, 2])
@@ -756,7 +846,11 @@ def _render_review_json_editor(
                         "due_date": a_due.strip() or None,
                         "status": a_status,
                         "resolution_evidence": a_ev.strip() or None,
-                        "completed_date": today_str if a_status == "Completed" else (sel_ai.get("completed_date") if sel_ai else None),
+                        "completed_date": (
+                            today_str
+                            if a_status == "Completed"
+                            else (sel_ai.get("completed_date") if sel_ai else None)
+                        ),
                     }
                     updated_ais = []
                     replaced = False
@@ -782,7 +876,9 @@ def _render_review_json_editor(
                         commit_message=f"chore(reviews): update action item {a_id.strip()} in Review {selected_rev_num} by {user.username}",
                         branch=ev.snapshot.default_branch,
                     )
-                    local_store.log_audit_event(user.username, user.role.value, "commit_review_action_item", selected_repo, msg)
+                    local_store.log_audit_event(
+                        user.username, user.role.value, "commit_review_action_item", selected_repo, msg
+                    )
                     if ok:
                         st.success(msg)
                         st.rerun()

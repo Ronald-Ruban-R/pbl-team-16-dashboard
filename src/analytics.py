@@ -1,693 +1,494 @@
 """
-Progress calculation, hybrid evidence verification, review comparison, and alert engine.
+Progress Calculation, Evidence Verification, Risk Detection, and Team Evaluation Engine.
 
-Core rules enforced:
-1. NEVER calculate or infer project completion from commit counts, lines of code, or push activity.
-2. Clearly distinguish between:
-   - `0.0%` completion (structured tasks/milestones exist and 0% are completed),
-   - `"Not Reported"` (no structured `tasks.json` or `progress.json` present),
-   - `"Data Malformed"` (JSON validation failed), and
-   - `"Repository Unavailable"` (GitHub API retrieval failed).
-3. Hybrid verification model: Cross-checks student-reported task/milestone/review evidence links
-   against the actual GitHub repository file tree to compute both *Reported Completion %* and
-   *Evidence-Verified Completion %*.
-4. Validates milestone weight totals and normalizes weights transparently if they do not sum to 100%.
+Computes:
+- Dual progress metrics:
+  1. Reported Progress (`project/progress.json`)
+  2. Verified Progress (weighted milestones + task completion + review deliverables verified in the repository tree)
+- Member contribution matrix (assigned, completed, in-progress, blocked, overdue, verified tasks)
+- Automated alerts (stale progress, stale commits, overdue tasks, unverified claims, missing required files)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Set
 
 from src.config import (
     CONVENTION_FILES,
-    DashboardConfig,
     RECOMMENDED_CATEGORY_FOLDERS,
+    DashboardConfig,
+    format_repo_display_name,
 )
 from src.github_client import RepoFileEntry, RepositorySnapshot
 from src.validators import (
     ActionItemRecord,
-    MemberResponsibility,
+    ProgressRecord,
     ProjectMetadata,
-    ReportedProgress,
-    ResearchEntry,
+    ResponsibilityRecord,
     ReviewRecord,
-    TaskRecord,
+    TaskItem,
     TeamMember,
     TimelineEvent,
-    ValidationReport,
-    ValidationState,
-    parse_iso_date,
-    validate_members_data,
-    validate_progress_data,
-    validate_project_metadata,
-    validate_responsibilities_data,
-    validate_review_data,
-    validate_tasks_data,
-    validate_timeline_data,
+    ValidationIssue,
+    parse_progress,
+    parse_project_metadata,
+    parse_responsibilities,
+    parse_review,
+    parse_tasks,
+    parse_team_members,
+    parse_timeline,
 )
+
+
+def parse_iso_date(date_str: Optional[str]) -> Optional[datetime]:
+    """Parse an ISO-8601 date (`YYYY-MM-DD` or full timestamp) into a UTC-aware datetime."""
+    if not date_str or not str(date_str).strip():
+        return None
+    s = str(date_str).strip()
+    try:
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":
+            dt = datetime.strptime(s, "%Y-%m-%d")
+            return dt.replace(tzinfo=timezone.utc)
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def is_evidence_verified_in_repo(evidence_ref: Optional[str], repo_paths_lower: Set[str]) -> bool:
+    """
+    Return True if `evidence_ref` is an external URL (`https://...`) or matches an existing
+    file or directory prefix in `repo_paths_lower`.
+    """
+    if not evidence_ref or not str(evidence_ref).strip():
+        return False
+    ref = str(evidence_ref).strip()
+    if ref.startswith(("https://", "http://")):
+        return True
+    clean = ref.strip("/").lower()
+    if not clean:
+        return False
+    if clean in repo_paths_lower:
+        return True
+    prefix = clean + "/"
+    return any(p.startswith(prefix) for p in repo_paths_lower)
 
 
 @dataclass
 class AlertItem:
-    """Actionable mentor alert for a team."""
+    """Automated risk or governance alert for a team repository."""
 
-    repo_name: str
-    team_name: str
-    severity: str  # "critical", "warning", "info"
-    category: str  # "Access", "Malformed Data", "Missing Deliverable", "Overdue Task", "Stale Update", "Action Item"
+    severity: str  # "high", "medium", "low"
+    category: str
     message: str
 
 
 @dataclass
-class TaskProgressMetrics:
-    """Quantitative breakdown of team tasks."""
+class MemberTaskStats:
+    """Per-member task execution and verification breakdown."""
 
-    status_label: str  # "Reported", "Not Reported", "Malformed", "Unavailable"
-    total_tasks: int = 0
-    completed_tasks: int = 0
-    in_progress_tasks: int = 0
-    blocked_tasks: int = 0
-    not_started_tasks: int = 0
-    overdue_tasks: int = 0
-    evidence_linked_tasks: int = 0
-    evidence_verified_tasks: int = 0
-    reported_completion_pct: Optional[float] = None
-    verified_completion_pct: Optional[float] = None
-    member_task_breakdown: Dict[str, Dict[str, int]] = field(default_factory=dict)
-
-
-@dataclass
-class MilestoneWeightSummary:
-    """Summary of weighted milestone completion."""
-
-    status_label: str  # "Reported", "Not Reported", "Invalid Weights"
-    total_milestones: int = 0
-    completed_milestones: int = 0
-    pending_milestones: int = 0
-    raw_weight_sum: float = 0.0
-    weights_valid_100: bool = False
-    weighted_completion_pct: Optional[float] = None
-    verified_weighted_pct: Optional[float] = None
-    weight_warning: Optional[str] = None
+    member_name: str
+    role: str
+    assigned_count: int = 0
+    completed_count: int = 0
+    in_progress_count: int = 0
+    blocked_count: int = 0
+    overdue_count: int = 0
+    verified_completed_count: int = 0
+    completion_rate_pct: float = 0.0
 
 
 @dataclass
 class TeamEvaluationSummary:
-    """
-    Consolidated, validated view of a single team's repository, metadata, progress,
-    tasks, reviews, timeline, categorized files, and mentor alerts.
-    """
+    """Comprehensive evaluated state of a single team repository."""
 
     repo_name: str
     snapshot: RepositorySnapshot
-    validation_reports: Dict[str, ValidationReport] = field(default_factory=dict)
     metadata: Optional[ProjectMetadata] = None
-    progress: Optional[ReportedProgress] = None
     members: List[TeamMember] = field(default_factory=list)
-    responsibilities: List[MemberResponsibility] = field(default_factory=list)
-    tasks: List[TaskRecord] = field(default_factory=list)
+    responsibilities: List[ResponsibilityRecord] = field(default_factory=list)
+    progress: Optional[ProgressRecord] = None
+    timeline: List[TimelineEvent] = field(default_factory=list)
+    tasks: List[TaskItem] = field(default_factory=list)
     reviews: Dict[int, ReviewRecord] = field(default_factory=dict)
-    timeline_events: List[TimelineEvent] = field(default_factory=list)
+    readme_text: Optional[str] = None
 
-    # Computed metrics
-    task_metrics: TaskProgressMetrics = field(
-        default_factory=lambda: TaskProgressMetrics(status_label="Not Reported")
-    )
-    milestone_metrics: MilestoneWeightSummary = field(
-        default_factory=lambda: MilestoneWeightSummary(status_label="Not Reported")
-    )
-    hybrid_progress_pct: Optional[float] = None
-    progress_display_status: str = "Not Reported"
-    current_review_label: str = "Not Reported"
-    unresolved_action_items: List[Tuple[int, ActionItemRecord]] = field(default_factory=list)
-    categorized_files: Dict[str, List[RepoFileEntry]] = field(default_factory=dict)
-    custom_top_folders: List[str] = field(default_factory=list)
-    research_and_competition_items: List[ResearchEntry] = field(default_factory=list)
-    alerts: List[AlertItem] = field(default_factory=list)
-    attention_level: str = "On Track"  # "On Track", "Needs Attention", "Critical / Blocked", "Unavailable"
-    last_reported_date: Optional[str] = None
-    days_since_last_report: Optional[int] = None
+    reported_progress_pct: float = 0.0
+    verified_progress_pct: float = 0.0
+    progress_discrepancy_pct: float = 0.0
+    milestone_completion_pct: float = 0.0
+    task_completion_pct: float = 0.0
+    verified_task_completion_pct: float = 0.0
+    deliverable_verification_pct: float = 0.0
+
+    total_tasks: int = 0
+    completed_tasks: int = 0
+    in_progress_tasks: int = 0
+    blocked_tasks: int = 0
+    delayed_tasks: int = 0
+    overdue_tasks: List[TaskItem] = field(default_factory=list)
+    unverified_completed_tasks: List[TaskItem] = field(default_factory=list)
+    unresolved_action_items: List[ActionItemRecord] = field(default_factory=list)
+
     days_since_last_commit: Optional[int] = None
+    days_since_progress_update: Optional[int] = None
+    health_status: str = "Needs Attention"  # "On Track", "Needs Attention", "At Risk"
+
+    categorized_files: Dict[str, List[RepoFileEntry]] = field(default_factory=dict)
+    convention_file_presence: Dict[str, bool] = field(default_factory=dict)
+    member_stats: List[MemberTaskStats] = field(default_factory=list)
+    alerts: List[AlertItem] = field(default_factory=list)
+    validation_issues: List[ValidationIssue] = field(default_factory=list)
+
+    @property
+    def display_team_name(self) -> str:
+        """Return a guaranteed clean, placeholder-free team display name."""
+        if self.metadata and self.metadata.team_name:
+            return self.metadata.team_name
+        return format_repo_display_name(self.repo_name)
 
 
-def is_evidence_verified_in_repo(evidence_link: Optional[str], repo_file_paths_lower: Set[str]) -> bool:
-    """
-    Verify whether an evidence link points to an existing file/directory inside the repository
-    or is a valid external URL.
-    """
-    if not evidence_link or not isinstance(evidence_link, str):
-        return False
-    cleaned = evidence_link.strip()
-    if not cleaned:
-        return False
-    if cleaned.startswith(("https://", "http://")):
-        return True
-    norm_path = cleaned.strip("/").lower()
-    if norm_path in repo_file_paths_lower:
-        return True
-    prefix = norm_path + "/"
-    return any(p.startswith(prefix) for p in repo_file_paths_lower)
-
-
-def compute_task_metrics(
-    tasks: Optional[List[TaskRecord]],
-    tasks_report: ValidationReport,
-    repo_accessible: bool,
-    repo_file_paths_lower: Set[str],
-    reference_date: Optional[date] = None,
-) -> TaskProgressMetrics:
-    """
-    Calculate task completion percentages and per-member breakdown using explicit rules:
-    - Each task has a `weight` (default 1.0).
-    - `Completed` contributes 100% of its weight to `reported_completion_pct`.
-    - `In Progress` contributes 0% to strict completion (never guesses partial percentages).
-    - `verified_completion_pct` counts a task as completed ONLY if `status == "Completed"` AND
-      its `evidence_link` is non-empty and verified in the repository (or external HTTPS URL).
-    - If `tasks.json` is missing, returns `status_label="Not Reported"` and `reported_completion_pct=None`.
-    """
-    today = reference_date or datetime.now(timezone.utc).date()
-
-    if not repo_accessible:
-        return TaskProgressMetrics(status_label="Unavailable")
-
-    if tasks_report.state == ValidationState.MALFORMED:
-        return TaskProgressMetrics(status_label="Malformed")
-
-    if tasks_report.state != ValidationState.VALID or tasks is None:
-        return TaskProgressMetrics(status_label="Not Reported")
-
-    if len(tasks) == 0:
-        return TaskProgressMetrics(
-            status_label="Reported",
-            total_tasks=0,
-            reported_completion_pct=0.0,
-            verified_completion_pct=0.0,
-        )
-
-    total_weight = 0.0
-    completed_weight = 0.0
-    verified_weight = 0.0
-
-    completed_count = 0
-    in_progress_count = 0
-    blocked_count = 0
-    not_started_count = 0
-    overdue_count = 0
-    evidence_linked_count = 0
-    evidence_verified_count = 0
-    member_map: Dict[str, Dict[str, int]] = {}
-
-    for t in tasks:
-        w = max(0.0, float(t.weight or 1.0))
-        total_weight += w
-        assignee = t.assigned_to or "Unassigned"
-        if assignee not in member_map:
-            member_map[assignee] = {
-                "total": 0,
-                "completed": 0,
-                "in_progress": 0,
-                "blocked": 0,
-                "not_started": 0,
-                "overdue": 0,
-            }
-        member_map[assignee]["total"] += 1
-
-        has_evidence = bool(t.evidence_link and t.evidence_link.strip())
-        is_verified = is_evidence_verified_in_repo(t.evidence_link, repo_file_paths_lower)
-        if has_evidence:
-            evidence_linked_count += 1
-        if is_verified:
-            evidence_verified_count += 1
-
-        if t.status == "Completed":
-            completed_count += 1
-            completed_weight += w
-            member_map[assignee]["completed"] += 1
-            if is_verified:
-                verified_weight += w
-        elif t.status == "In Progress":
-            in_progress_count += 1
-            member_map[assignee]["in_progress"] += 1
-        elif t.status == "Blocked":
-            blocked_count += 1
-            member_map[assignee]["blocked"] += 1
-        else:
-            not_started_count += 1
-            member_map[assignee]["not_started"] += 1
-
-        if t.status != "Completed" and t.due_date:
-            due_dt = parse_iso_date(t.due_date)
-            if due_dt and due_dt < today:
-                overdue_count += 1
-                member_map[assignee]["overdue"] += 1
-
-    reported_pct = round((completed_weight / total_weight) * 100.0, 1) if total_weight > 0 else 0.0
-    verified_pct = round((verified_weight / total_weight) * 100.0, 1) if total_weight > 0 else 0.0
-
-    return TaskProgressMetrics(
-        status_label="Reported",
-        total_tasks=len(tasks),
-        completed_tasks=completed_count,
-        in_progress_tasks=in_progress_count,
-        blocked_tasks=blocked_count,
-        not_started_tasks=not_started_count,
-        overdue_tasks=overdue_count,
-        evidence_linked_tasks=evidence_linked_count,
-        evidence_verified_tasks=evidence_verified_count,
-        reported_completion_pct=reported_pct,
-        verified_completion_pct=verified_pct,
-        member_task_breakdown=member_map,
-    )
-
-
-def compute_milestone_metrics(
-    progress: Optional[ReportedProgress],
-    progress_report: ValidationReport,
-    repo_accessible: bool,
-    repo_file_paths_lower: Set[str],
-    custom_weights: Optional[Dict[str, float]] = None,
-) -> MilestoneWeightSummary:
-    """
-    Calculate weighted milestone completion from `project/progress.json`.
-    Validates that milestone weights sum to 100.0% (within 0.05 tolerance).
-    If weights do not sum to 100%, normalizes by total positive weight and attaches a clear warning.
-    """
-    if not repo_accessible:
-        return MilestoneWeightSummary(status_label="Unavailable")
-
-    if progress_report.state == ValidationState.MALFORMED:
-        return MilestoneWeightSummary(status_label="Malformed")
-
-    if progress_report.state != ValidationState.VALID or progress is None:
-        return MilestoneWeightSummary(status_label="Not Reported")
-
-    milestones = progress.milestones
-    if not milestones:
-        return MilestoneWeightSummary(
-            status_label="Reported",
-            total_milestones=0,
-            weighted_completion_pct=progress.overall_reported_pct,
-            verified_weighted_pct=None,
-        )
-
-    raw_sum = 0.0
-    completed_cnt = 0
-    pending_cnt = 0
-    weighted_acc = 0.0
-    verified_acc = 0.0
-
-    effective_weights: List[float] = []
-    for m in milestones:
-        w = custom_weights.get(m.milestone_id, m.weight) if custom_weights else m.weight
-        if w <= 0:
-            w = 1.0
-        effective_weights.append(w)
-        raw_sum += w
-
-    weights_valid_100 = abs(raw_sum - 100.0) <= 0.05
-    warning_msg: Optional[str] = None
-    if not weights_valid_100:
-        warning_msg = (
-            f"Milestone weights sum to {raw_sum:.1f}% instead of 100.0%. "
-            "Completion has been normalized proportionally across the defined weights."
-        )
-
-    for m, w in zip(milestones, effective_weights):
-        if m.status == "Completed":
-            completed_cnt += 1
-            m_pct = 100.0
-        else:
-            pending_cnt += 1
-            m_pct = float(m.completion_pct) if m.completion_pct is not None else 0.0
-
-        weighted_acc += w * (m_pct / 100.0)
-        if m.status == "Completed" and is_evidence_verified_in_repo(m.evidence_path, repo_file_paths_lower):
-            verified_acc += w
-        elif m.status != "Completed" and is_evidence_verified_in_repo(m.evidence_path, repo_file_paths_lower):
-            verified_acc += w * (m_pct / 100.0)
-
-    norm_pct = round((weighted_acc / raw_sum) * 100.0, 1) if raw_sum > 0 else 0.0
-    ver_pct = round((verified_acc / raw_sum) * 100.0, 1) if raw_sum > 0 else 0.0
-
-    return MilestoneWeightSummary(
-        status_label="Reported",
-        total_milestones=len(milestones),
-        completed_milestones=completed_cnt,
-        pending_milestones=pending_cnt,
-        raw_weight_sum=round(raw_sum, 2),
-        weights_valid_100=weights_valid_100,
-        weighted_completion_pct=norm_pct,
-        verified_weighted_pct=ver_pct,
-        weight_warning=warning_msg,
-    )
-
-
-def categorize_repository_files(
-    repo_name: str,
-    org: str,
-    default_branch: str,
-    tree_entries: List[RepoFileEntry],
-) -> Tuple[Dict[str, List[RepoFileEntry]], List[str], List[ResearchEntry]]:
-    """
-    Dynamically categorize repository files into standard project areas AND identify
-    custom top-level folders created by the student team.
-    Also extracts structured `ResearchEntry` items for the Research & Competition tracker.
-    """
-    categories: Dict[str, List[RepoFileEntry]] = {k: [] for k in RECOMMENDED_CATEGORY_FOLDERS}
-    categories["Source Code & Implementation"] = []
-    categories["Custom & Other Files"] = []
-
-    known_folder_names: Set[str] = set()
-    for folder_tuple in RECOMMENDED_CATEGORY_FOLDERS.values():
-        for fname in folder_tuple:
-            known_folder_names.add(fname.lower())
-
-    custom_top_folders: Set[str] = set()
-    research_items: List[ResearchEntry] = []
+def categorize_repository_files(tree_entries: List[RepoFileEntry]) -> Dict[str, List[RepoFileEntry]]:
+    """Group repository files into standard PBL categories plus custom top-level folders."""
+    categories: Dict[str, List[RepoFileEntry]] = {cat: [] for cat in RECOMMENDED_CATEGORY_FOLDERS}
+    folder_to_cat: Dict[str, str] = {}
+    for cat, prefixes in RECOMMENDED_CATEGORY_FOLDERS.items():
+        for p in prefixes:
+            folder_to_cat[p.lower()] = cat
 
     for entry in tree_entries:
-        parts = entry.path.split("/")
-        top_segment = parts[0].lower() if parts else ""
-
-        if entry.item_type == "dir" and len(parts) == 1:
-            if top_segment not in known_folder_names and not top_segment.startswith("."):
-                custom_top_folders.add(entry.name)
-            continue
-
         if entry.item_type != "file":
             continue
-
-        matched_cat: Optional[str] = None
-        for cat_name, prefixes in RECOMMENDED_CATEGORY_FOLDERS.items():
-            if top_segment in prefixes or any(seg.lower() in prefixes for seg in parts[:-1]):
-                matched_cat = cat_name
-                break
-
+        parts = entry.path.strip("/").split("/")
+        if len(parts) == 1:
+            categories.setdefault("Root Files", []).append(entry)
+            continue
+        top_folder = parts[0].lower()
+        matched_cat = folder_to_cat.get(top_folder)
         if matched_cat:
             categories[matched_cat].append(entry)
-        elif entry.extension in (".py", ".js", ".ts", ".tsx", ".jsx", ".cpp", ".c", ".java", ".go", ".rs", ".sql", ".html", ".css", ".sh"):
-            categories["Source Code & Implementation"].append(entry)
         else:
-            categories["Custom & Other Files"].append(entry)
-            if len(parts) > 1 and top_segment not in known_folder_names and not top_segment.startswith("."):
-                custom_top_folders.add(parts[0])
+            custom_label = f"Custom Folder: {parts[0]}"
+            categories.setdefault(custom_label, []).append(entry)
 
-        if matched_cat in ("Research & Literature", "Datasets & Experiments", "Competitions & Achievements", "Technical Documentation"):
-            sub_type = {
-                "Research & Literature": "Literature Review / Research",
-                "Datasets & Experiments": "Dataset / Experiment",
-                "Competitions & Achievements": "Competition / Certificate",
-                "Technical Documentation": "Technical Documentation",
-            }[matched_cat]
-            research_items.append(
-                ResearchEntry(
-                    entry_id=f"{repo_name}:{entry.path}",
-                    title=entry.name,
-                    category=sub_type,
-                    file_path=entry.path,
-                    html_url=entry.html_url or f"https://github.com/{org}/{repo_name}/blob/{default_branch}/{entry.path}",
-                    phase="Repository Artifact",
-                    summary=f"Size: {entry.size:,} bytes | Path: {entry.path}",
-                )
-            )
-
-    return categories, sorted(custom_top_folders), research_items
+    return {k: v for k, v in categories.items() if v}
 
 
 def evaluate_team_repository(
     snapshot: RepositorySnapshot,
     config: DashboardConfig,
     custom_milestone_weights: Optional[Dict[str, float]] = None,
-    reference_date: Optional[date] = None,
+    reference_now: Optional[datetime] = None,
 ) -> TeamEvaluationSummary:
-    """
-    Perform complete validation, progress calculation, evidence verification,
-    and alert generation for a single team's `RepositorySnapshot`.
-    """
-    today = reference_date or datetime.now(timezone.utc).date()
-    summary = TeamEvaluationSummary(repo_name=snapshot.repo_name, snapshot=snapshot)
+    """Evaluate a `RepositorySnapshot` into a `TeamEvaluationSummary`."""
+    now = reference_now or datetime.now(timezone.utc)
+    repo_name = snapshot.repo_name
+    summary = TeamEvaluationSummary(repo_name=repo_name, snapshot=snapshot)
 
     if not snapshot.accessible:
-        summary.progress_display_status = "Repository Unavailable"
-        summary.attention_level = "Unavailable"
+        summary.health_status = "At Risk"
         summary.alerts.append(
             AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=snapshot.repo_name,
-                severity="critical",
-                category="Access",
-                message=snapshot.error_message or f"Repository `{snapshot.repo_name}` could not be accessed.",
+                severity="high",
+                category="Repository Connectivity",
+                message=snapshot.error_message or f"Repository `{repo_name}` is unreachable.",
             )
         )
         return summary
 
+    for label, rel_path in CONVENTION_FILES.items():
+        f_res = snapshot.convention_raw_files.get(rel_path)
+        summary.convention_file_presence[rel_path] = bool(f_res and f_res.exists)
+
+    readme_res = snapshot.convention_raw_files.get(CONVENTION_FILES["readme"])
+    if readme_res and readme_res.exists and readme_res.text_content:
+        summary.readme_text = readme_res.text_content
+
+    meta_res = snapshot.convention_raw_files.get(CONVENTION_FILES["metadata"])
+    if meta_res and meta_res.exists:
+        meta_obj, meta_issues = parse_project_metadata(
+            meta_res.text_content, repo_name=repo_name, file_path=CONVENTION_FILES["metadata"]
+        )
+        summary.metadata = meta_obj
+        summary.validation_issues.extend(meta_issues)
+
+    mem_res = snapshot.convention_raw_files.get(CONVENTION_FILES["members"])
+    if mem_res and mem_res.exists:
+        members_list, mem_issues = parse_team_members(
+            mem_res.text_content, file_path=CONVENTION_FILES["members"]
+        )
+        summary.members = members_list
+        summary.validation_issues.extend(mem_issues)
+
+    resp_res = snapshot.convention_raw_files.get(CONVENTION_FILES["responsibilities"])
+    if resp_res and resp_res.exists:
+        resp_list, resp_issues = parse_responsibilities(
+            resp_res.text_content, file_path=CONVENTION_FILES["responsibilities"]
+        )
+        summary.responsibilities = resp_list
+        summary.validation_issues.extend(resp_issues)
+
+    prog_res = snapshot.convention_raw_files.get(CONVENTION_FILES["progress"])
+    if prog_res and prog_res.exists:
+        prog_obj, prog_issues = parse_progress(
+            prog_res.text_content, file_path=CONVENTION_FILES["progress"]
+        )
+        summary.progress = prog_obj
+        summary.validation_issues.extend(prog_issues)
+
+    tl_res = snapshot.convention_raw_files.get(CONVENTION_FILES["timeline"])
+    if tl_res and tl_res.exists:
+        tl_list, tl_issues = parse_timeline(
+            tl_res.text_content, file_path=CONVENTION_FILES["timeline"]
+        )
+        summary.timeline = tl_list
+        summary.validation_issues.extend(tl_issues)
+
+    tasks_res = snapshot.convention_raw_files.get(CONVENTION_FILES["tasks"])
+    if tasks_res and tasks_res.exists:
+        t_list, t_issues = parse_tasks(
+            tasks_res.text_content, file_path=CONVENTION_FILES["tasks"]
+        )
+        summary.tasks = t_list
+        summary.validation_issues.extend(t_issues)
+
+    for rel_path, f_res in snapshot.convention_raw_files.items():
+        if rel_path.startswith("reviews/") and rel_path.endswith(".json") and f_res.exists:
+            default_num = 1
+            for d_rev in config.reviews:
+                if d_rev.default_file_path.lower() == rel_path.lower():
+                    default_num = d_rev.review_number
+                    break
+            rev_obj, rev_issues = parse_review(
+                f_res.text_content, default_review_number=default_num, file_path=rel_path
+            )
+            summary.validation_issues.extend(rev_issues)
+            if rev_obj:
+                summary.reviews[rev_obj.review_number] = rev_obj
+
+    summary.categorized_files = categorize_repository_files(snapshot.tree_entries)
     repo_paths_lower: Set[str] = {
         e.path.strip("/").lower() for e in snapshot.tree_entries if e.item_type == "file"
     }
 
-    def _raw(rel_path: str):
-        res = snapshot.convention_raw_files.get(rel_path)
-        if res is None:
-            return None, False, None
-        return res.text_content, res.exists, res.error_message
+    # Task metrics
+    summary.total_tasks = len(summary.tasks)
+    total_task_weight = 0.0
+    completed_task_weight = 0.0
+    verified_task_weight = 0.0
 
-    meta_report = validate_project_metadata(*_raw(CONVENTION_FILES["metadata"]), file_path=CONVENTION_FILES["metadata"])
-    prog_report = validate_progress_data(*_raw(CONVENTION_FILES["progress"]), file_path=CONVENTION_FILES["progress"])
-    time_report = validate_timeline_data(*_raw(CONVENTION_FILES["timeline"]), file_path=CONVENTION_FILES["timeline"])
-    memb_report = validate_members_data(*_raw(CONVENTION_FILES["members"]), file_path=CONVENTION_FILES["members"])
-    resp_report = validate_responsibilities_data(*_raw(CONVENTION_FILES["responsibilities"]), file_path=CONVENTION_FILES["responsibilities"])
-    task_report = validate_tasks_data(*_raw(CONVENTION_FILES["tasks"]), file_path=CONVENTION_FILES["tasks"])
+    for t in summary.tasks:
+        w = max(0.1, float(t.weight or 1.0))
+        total_task_weight += w
+        if t.status == "Completed":
+            summary.completed_tasks += 1
+            completed_task_weight += w
+            if is_evidence_verified_in_repo(t.evidence_link, repo_paths_lower):
+                verified_task_weight += w
+            else:
+                summary.unverified_completed_tasks.append(t)
+        elif t.status == "In Progress":
+            summary.in_progress_tasks += 1
+            completed_task_weight += 0.35 * w
+            verified_task_weight += 0.25 * w
+        elif t.status == "Blocked":
+            summary.blocked_tasks += 1
+        elif t.status == "Delayed":
+            summary.delayed_tasks += 1
 
-    summary.validation_reports = {
-        CONVENTION_FILES["metadata"]: meta_report,
-        CONVENTION_FILES["progress"]: prog_report,
-        CONVENTION_FILES["timeline"]: time_report,
-        CONVENTION_FILES["members"]: memb_report,
-        CONVENTION_FILES["responsibilities"]: resp_report,
-        CONVENTION_FILES["tasks"]: task_report,
-    }
+        if t.status != "Completed" and t.due_date:
+            due_dt = parse_iso_date(t.due_date)
+            if due_dt and due_dt < now:
+                summary.overdue_tasks.append(t)
 
-    if meta_report.state == ValidationState.VALID:
-        summary.metadata = meta_report.parsed_data
-    if prog_report.state == ValidationState.VALID:
-        summary.progress = prog_report.parsed_data
-    if time_report.state == ValidationState.VALID:
-        summary.timeline_events = time_report.parsed_data or []
-    if memb_report.state == ValidationState.VALID:
-        summary.members = memb_report.parsed_data or []
-    if resp_report.state == ValidationState.VALID:
-        summary.responsibilities = resp_report.parsed_data or []
-    if task_report.state == ValidationState.VALID:
-        summary.tasks = task_report.parsed_data or []
+    if total_task_weight > 0:
+        summary.task_completion_pct = round((completed_task_weight / total_task_weight) * 100.0, 1)
+        summary.verified_task_completion_pct = round((verified_task_weight / total_task_weight) * 100.0, 1)
 
-    team_display_name = (
-        summary.metadata.team_name
-        if summary.metadata and summary.metadata.team_name
-        else snapshot.repo_name
-    )
-
-    for path_key, raw_res in sorted(snapshot.convention_raw_files.items()):
-        if path_key.startswith("reviews/") and path_key.endswith(".json"):
-            r_report = validate_review_data(
-                raw_res.text_content,
-                raw_res.exists,
-                raw_res.error_message,
-                file_path=path_key,
+    # Milestone metrics
+    if summary.progress and summary.progress.milestones:
+        ms_total_w = 0.0
+        ms_earned_w = 0.0
+        for m in summary.progress.milestones:
+            mw = (
+                float(custom_milestone_weights[m.milestone_id])
+                if custom_milestone_weights and m.milestone_id in custom_milestone_weights
+                else max(0.0, float(m.weight))
             )
-            summary.validation_reports[path_key] = r_report
-            if r_report.state == ValidationState.VALID and isinstance(r_report.parsed_data, ReviewRecord):
-                rev: ReviewRecord = r_report.parsed_data
-                summary.reviews[rev.review_number] = rev
+            ms_total_w += mw
+            pct = 100.0 if m.status == "Completed" else float(m.completion_pct or 0.0)
+            if m.status == "Completed" and m.evidence_path:
+                if not is_evidence_verified_in_repo(m.evidence_path, repo_paths_lower):
+                    pct = min(pct, 60.0)
+            ms_earned_w += mw * (pct / 100.0)
+        if ms_total_w > 0:
+            summary.milestone_completion_pct = round((ms_earned_w / ms_total_w) * 100.0, 1)
 
-    summary.task_metrics = compute_task_metrics(
-        summary.tasks if task_report.state == ValidationState.VALID else None,
-        task_report,
-        snapshot.accessible,
-        repo_paths_lower,
-        reference_date=today,
-    )
-    summary.milestone_metrics = compute_milestone_metrics(
-        summary.progress if prog_report.state == ValidationState.VALID else None,
-        prog_report,
-        snapshot.accessible,
-        repo_paths_lower,
-        custom_weights=custom_milestone_weights,
-    )
+    # Review deliverable verification
+    total_req_deliv = 0
+    verified_req_deliv = 0
+    for rev in summary.reviews.values():
+        for d in rev.deliverables:
+            if d.required:
+                total_req_deliv += 1
+                if d.submitted and is_evidence_verified_in_repo(d.artifact_path, repo_paths_lower):
+                    verified_req_deliv += 1
+        for ai in rev.action_items:
+            if ai.status != "Completed":
+                summary.unresolved_action_items.append(ai)
 
-    t_pct = summary.task_metrics.reported_completion_pct
-    m_pct = summary.milestone_metrics.weighted_completion_pct
-    if t_pct is not None and m_pct is not None:
-        summary.hybrid_progress_pct = round(0.5 * m_pct + 0.5 * t_pct, 1)
-        summary.progress_display_status = f"{summary.hybrid_progress_pct:.1f}%"
-    elif t_pct is not None:
-        summary.hybrid_progress_pct = t_pct
-        summary.progress_display_status = f"{t_pct:.1f}% (Tasks)"
-    elif m_pct is not None:
-        summary.hybrid_progress_pct = m_pct
-        summary.progress_display_status = f"{m_pct:.1f}% (Milestones)"
-    elif prog_report.state == ValidationState.MALFORMED or task_report.state == ValidationState.MALFORMED:
-        summary.hybrid_progress_pct = None
-        summary.progress_display_status = "Malformed Metadata"
+    if total_req_deliv > 0:
+        summary.deliverable_verification_pct = round((verified_req_deliv / total_req_deliv) * 100.0, 1)
+
+    # Reported vs Verified overall progress
+    if summary.progress and summary.progress.overall_reported_pct is not None:
+        summary.reported_progress_pct = round(float(summary.progress.overall_reported_pct), 1)
     else:
-        summary.hybrid_progress_pct = None
-        summary.progress_display_status = "Not Reported"
+        summary.reported_progress_pct = summary.task_completion_pct
 
-    if summary.reviews:
-        highest_completed = [
-            r for r in summary.reviews.values() if r.submission_status in ("Submitted", "Reviewed")
-        ]
-        if highest_completed:
-            latest_rev = max(highest_completed, key=lambda r: r.review_number)
-            summary.current_review_label = f"Review {latest_rev.review_number} ({latest_rev.submission_status})"
-        else:
-            first_rev = min(summary.reviews.values(), key=lambda r: r.review_number)
-            summary.current_review_label = f"Review {first_rev.review_number} ({first_rev.submission_status})"
+    components: List[Tuple[float, float]] = []
+    if summary.progress and summary.progress.milestones:
+        components.append((summary.milestone_completion_pct, 0.45))
+    if summary.total_tasks > 0:
+        components.append((summary.verified_task_completion_pct, 0.35))
+    if total_req_deliv > 0:
+        components.append((summary.deliverable_verification_pct, 0.20))
 
-        for r_num, rev in sorted(summary.reviews.items()):
-            for ai in rev.action_items:
-                if ai.status != "Completed":
-                    summary.unresolved_action_items.append((r_num, ai))
+    if components:
+        w_sum = sum(w for _, w in components)
+        summary.verified_progress_pct = round(sum(val * w for val, w in components) / w_sum, 1)
     else:
-        summary.current_review_label = "Not Reported"
+        summary.verified_progress_pct = 0.0
 
-    cat_files, custom_folders, research_items = categorize_repository_files(
-        snapshot.repo_name,
-        snapshot.org,
-        snapshot.default_branch,
-        snapshot.tree_entries,
+    summary.progress_discrepancy_pct = round(
+        summary.reported_progress_pct - summary.verified_progress_pct, 1
     )
-    summary.categorized_files = cat_files
-    summary.custom_top_folders = custom_folders
-    summary.research_and_competition_items = research_items
+
+    # Per-member contribution statistics
+    member_map: Dict[str, MemberTaskStats] = {}
+    for m in summary.members:
+        member_map[m.name.lower()] = MemberTaskStats(member_name=m.name, role=m.role)
+
+    overdue_ids = {t.task_id for t in summary.overdue_tasks}
+    for t in summary.tasks:
+        assignee_key = (t.assigned_to or "Unassigned").strip().lower()
+        if assignee_key not in member_map:
+            member_map[assignee_key] = MemberTaskStats(
+                member_name=t.assigned_to or "Unassigned",
+                role="Contributor",
+            )
+        st_obj = member_map[assignee_key]
+        st_obj.assigned_count += 1
+        if t.status == "Completed":
+            st_obj.completed_count += 1
+            if is_evidence_verified_in_repo(t.evidence_link, repo_paths_lower):
+                st_obj.verified_completed_count += 1
+        elif t.status == "In Progress":
+            st_obj.in_progress_count += 1
+        elif t.status == "Blocked":
+            st_obj.blocked_count += 1
+        if t.task_id in overdue_ids:
+            st_obj.overdue_count += 1
+
+    for st_obj in member_map.values():
+        if st_obj.assigned_count > 0:
+            st_obj.completion_rate_pct = round(
+                (st_obj.completed_count / st_obj.assigned_count) * 100.0, 1
+            )
+    summary.member_stats = list(member_map.values())
+
+    # Freshness & Risk Alerts
+    latest_commit_dt: Optional[datetime] = None
+    if snapshot.recent_commits:
+        latest_commit_dt = parse_iso_date(snapshot.recent_commits[0].committed_date)
+    if not latest_commit_dt and snapshot.pushed_at:
+        latest_commit_dt = parse_iso_date(snapshot.pushed_at)
+
+    if latest_commit_dt:
+        summary.days_since_last_commit = max(0, (now - latest_commit_dt).days)
+        if summary.days_since_last_commit > config.stale_repo_commit_days:
+            summary.alerts.append(
+                AlertItem(
+                    severity="high",
+                    category="Stale Repository",
+                    message=f"No commits pushed in {summary.days_since_last_commit} days (threshold: {config.stale_repo_commit_days}d).",
+                )
+            )
 
     if summary.progress and summary.progress.last_updated:
-        summary.last_reported_date = summary.progress.last_updated
-        rep_dt = parse_iso_date(summary.progress.last_updated)
-        if rep_dt:
-            summary.days_since_last_report = max(0, (today - rep_dt).days)
-
-    latest_commit_date_str: Optional[str] = None
-    if snapshot.recent_commits:
-        latest_commit_date_str = snapshot.recent_commits[0].committed_date
-    elif snapshot.pushed_at:
-        latest_commit_date_str = snapshot.pushed_at
-
-    if latest_commit_date_str:
-        c_dt = parse_iso_date(latest_commit_date_str)
-        if c_dt:
-            summary.days_since_last_commit = max(0, (today - c_dt).days)
-
-    for fpath, vrep in summary.validation_reports.items():
-        if vrep.state == ValidationState.MALFORMED:
-            summary.alerts.append(
-                AlertItem(
-                    repo_name=snapshot.repo_name,
-                    team_name=team_display_name,
-                    severity="critical",
-                    category="Malformed Data",
-                    message=f"Malformed JSON in `{fpath}`: {'; '.join(vrep.errors)}",
+        prog_dt = parse_iso_date(summary.progress.last_updated)
+        if prog_dt:
+            summary.days_since_progress_update = max(0, (now - prog_dt).days)
+            if summary.days_since_progress_update > config.stale_progress_days:
+                summary.alerts.append(
+                    AlertItem(
+                        severity="medium",
+                        category="Stale Progress Report",
+                        message=f"`project/progress.json` last updated {summary.days_since_progress_update} days ago.",
+                    )
                 )
-            )
 
-    if meta_report.state == ValidationState.MISSING:
+    if not summary.metadata:
         summary.alerts.append(
             AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=team_display_name,
-                severity="warning",
-                category="Missing Deliverable",
-                message="Missing `project/metadata.json` (problem statement & project metadata not reported).",
+                severity="medium",
+                category="Missing Metadata",
+                message="`project/metadata.json` is missing or unreadable.",
             )
         )
 
-    if prog_report.state == ValidationState.MISSING and task_report.state == ValidationState.MISSING:
+    if summary.overdue_tasks:
         summary.alerts.append(
             AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=team_display_name,
-                severity="warning",
-                category="Missing Deliverable",
-                message="Both `project/progress.json` and `tasks/tasks.json` are missing; progress is Not Reported.",
+                severity="high" if len(summary.overdue_tasks) >= 3 else "medium",
+                category="Overdue Tasks",
+                message=f"{len(summary.overdue_tasks)} task(s) are past their due date.",
             )
         )
 
-    if summary.task_metrics.overdue_tasks > 0:
+    if summary.blocked_tasks > 0:
         summary.alerts.append(
             AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=team_display_name,
-                severity="warning",
-                category="Overdue Task",
-                message=f"{summary.task_metrics.overdue_tasks} task(s) are past their due date and not yet completed.",
+                severity="medium",
+                category="Blocked Tasks",
+                message=f"{summary.blocked_tasks} task(s) are currently marked as Blocked.",
             )
         )
 
-    if summary.task_metrics.blocked_tasks > 0:
+    if summary.unverified_completed_tasks:
         summary.alerts.append(
             AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=team_display_name,
-                severity="critical",
-                category="Overdue Task",
-                message=f"{summary.task_metrics.blocked_tasks} task(s) are currently marked as Blocked.",
+                severity="low",
+                category="Unverified Evidence",
+                message=f"{len(summary.unverified_completed_tasks)} completed task(s) lack a verified file path in the repository.",
             )
         )
 
-    if summary.days_since_last_report is not None and summary.days_since_last_report > config.stale_progress_days:
+    if summary.progress_discrepancy_pct >= 25.0:
         summary.alerts.append(
             AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=team_display_name,
-                severity="warning",
-                category="Stale Update",
-                message=f"Progress report (`project/progress.json`) has not been updated in {summary.days_since_last_report} days.",
+                severity="medium",
+                category="Progress Discrepancy",
+                message=(
+                    f"Reported progress ({summary.reported_progress_pct:.0f}%) exceeds verified "
+                    f"progress ({summary.verified_progress_pct:.0f}%) by {summary.progress_discrepancy_pct:.0f}%."
+                ),
             )
         )
 
-    if summary.days_since_last_commit is not None and summary.days_since_last_commit > config.stale_repo_commit_days:
-        summary.alerts.append(
-            AlertItem(
-                repo_name=snapshot.repo_name,
-                team_name=team_display_name,
-                severity="info",
-                category="Stale Update",
-                message=f"No GitHub commits recorded in the last {summary.days_since_last_commit} days.",
-            )
-        )
-
-    if summary.unresolved_action_items:
-        overdue_ais = [
-            ai for _, ai in summary.unresolved_action_items
-            if ai.due_date and (parse_iso_date(ai.due_date) or today) < today
-        ]
-        if overdue_ais:
-            summary.alerts.append(
-                AlertItem(
-                    repo_name=snapshot.repo_name,
-                    team_name=team_display_name,
-                    severity="critical",
-                    category="Action Item",
-                    message=f"{len(overdue_ais)} review action item(s) are overdue and unresolved.",
-                )
-            )
-        else:
-            summary.alerts.append(
-                AlertItem(
-                    repo_name=snapshot.repo_name,
-                    team_name=team_display_name,
-                    severity="info",
-                    category="Action Item",
-                    message=f"{len(summary.unresolved_action_items)} open review action item(s) pending resolution.",
-                )
-            )
-
-    if any(a.severity == "critical" for a in summary.alerts):
-        summary.attention_level = "Critical / Blocked"
-    elif any(a.severity == "warning" for a in summary.alerts) or summary.hybrid_progress_pct is None:
-        summary.attention_level = "Needs Attention"
+    high_alerts = sum(1 for a in summary.alerts if a.severity == "high")
+    med_alerts = sum(1 for a in summary.alerts if a.severity == "medium")
+    if high_alerts > 0 or med_alerts >= 3:
+        summary.health_status = "At Risk"
+    elif med_alerts > 0 or len(summary.alerts) >= 2:
+        summary.health_status = "Needs Attention"
     else:
-        summary.attention_level = "On Track"
+        summary.health_status = "On Track"
 
     return summary

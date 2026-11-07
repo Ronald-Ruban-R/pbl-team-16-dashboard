@@ -1,7 +1,7 @@
 """
-Settings, GitHub Connection Diagnostics, Rate-Limit Monitor & Security Audit View.
+Settings, GitHub Connection Diagnostics, Rate-Limit Monitor & Security Audit View (`src/views/settings.py`).
 
-Organized into three clean tabs:
+Organized into three clean, consistent tabs:
 1. `GitHub Connection & Cache`: Per-repo connectivity table, API rate-limit status, and manual cache refresh.
 2. `Security & Password Hasher`: Active user session info and PBKDF2-HMAC-SHA256 hash generator.
 3. `SQLite Audit & Database Management`: Security audit trail and 1-click local SQLite reset options.
@@ -20,6 +20,7 @@ from src.config import DashboardConfig
 from src.github_client import GitHubCohortClient
 from src.security import AuthenticatedUser, hash_password_pbkdf2
 from src.storage import MentorLocalStore
+from src.ui_theme import format_bool_indicator
 
 
 def render_settings_page(
@@ -29,8 +30,11 @@ def render_settings_page(
     user: AuthenticatedUser,
     local_store: MentorLocalStore,
 ) -> None:
-    """Render the clean, tab-organized Settings & Diagnostics view."""
+    """Render the Settings, Diagnostics & Security view."""
     st.markdown("## Settings, GitHub Diagnostics & Security")
+    st.caption(
+        "Monitor GitHub API quota, verify repository connectivity, generate PBKDF2 password hashes, and inspect audit logs."
+    )
 
     rl = github_client.rate_limit
     r1, r2, r3, r4 = st.columns(4)
@@ -61,7 +65,8 @@ def render_settings_page(
                 {
                     "Organization": snap.org,
                     "Repository": repo_name,
-                    "Status": "Connected" if snap.accessible else "Unreachable",
+                    "Team Name": ev.display_team_name,
+                    "Status": format_bool_indicator(snap.accessible, "Connected", "Unreachable"),
                     "HTTP": snap.status_code,
                     "Visibility": "Private" if snap.private else "Public",
                     "Default Branch": snap.default_branch if snap.accessible else "-",
@@ -112,7 +117,7 @@ def render_settings_page(
             st.divider()
             st.markdown("#### PBKDF2-HMAC-SHA256 Password Hash Generator")
             st.caption(
-                "Generate a salted PBKDF2-HMAC-SHA256 hash for any new mentor or student account "
+                "Generate a salted PBKDF2-HMAC-SHA256 hash for any mentor, team lead, or student account "
                 "to paste into `.streamlit/secrets.toml` (or Streamlit Cloud Secrets)."
             )
             pw_col1, pw_col2 = st.columns([2, 1])

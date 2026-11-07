@@ -1,4 +1,4 @@
-# PBL Cohort-X Mentor Dashboard — Python Dependencies
+# PBL Cohort-X Dashboard — Python Dependencies
 # Tested with Python 3.10, 3.11, and 3.12
 
 streamlit>=1.36.0,<2.0.0

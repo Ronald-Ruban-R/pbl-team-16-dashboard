@@ -1,3 +1,1 @@
-"""PBL Cohort-X Mentor Dashboard core package."""
-
-__version__ = "1.0.0"
+"""PBL Cohort-X Mentor & Team Dashboard package."""

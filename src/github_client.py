@@ -1,65 +1,64 @@
 """
-Secure GitHub REST API and GitHub App client for the PBL Cohort-X Mentor Dashboard.
+GitHub API Client & Authentication Provider for PBL Cohort-X.
 
-Features:
-- Supports both GitHub App Installation Authentication (RS256 JWT -> short-lived installation token)
-  and Fine-Grained Personal Access Token (PAT) authentication.
-- Enforces timeouts, exponential backoff retry logic on transient errors (502/503/504),
-  and transparent pagination.
-- Tracks GitHub API rate-limit headers (`X-RateLimit-Remaining`, `X-RateLimit-Reset`).
-- Isolates per-repository failures so one inaccessible or misconfigured repository never
-  breaks the remaining five repositories.
-- Redacts tokens from all exception messages and logs.
+Supports:
+- Fine-Grained Personal Access Tokens (PAT) and GitHub App RS256 JWT authentication.
+- Parallelized convention file fetching via `ThreadPoolExecutor` for fast startup.
+- In-memory TTL caching with per-repo invalidation.
+- Direct commit/writeback (`PUT /repos/{org}/{repo}/contents/{path}`) for all structured
+  JSON files under `project/`, `team/`, `tasks/`, and `reviews/`.
 """
 
 from __future__ import annotations
 
 import base64
-import json
-import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import json
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 import requests
 
 from src.config import (
     CONVENTION_FILES,
-    DashboardConfig,
     MAX_PREVIEW_FILE_BYTES,
+    DashboardConfig,
+    to_plain_dict,
 )
 from src.security import redact_secrets
 
 
 @dataclass
 class RateLimitStatus:
-    """Snapshot of the GitHub API rate limit."""
+    """Tracks GitHub API rate-limit headers."""
 
     limit: int = 5000
     remaining: int = 5000
-    reset_epoch: int = 0
     used: int = 0
+    reset_epoch: int = 0
     resource: str = "core"
-
-    @property
-    def reset_datetime_utc(self) -> Optional[datetime]:
-        if self.reset_epoch <= 0:
-            return None
-        return datetime.fromtimestamp(self.reset_epoch, tz=timezone.utc)
 
     @property
     def is_exhausted(self) -> bool:
         return self.remaining <= 0 and self.reset_epoch > int(time.time())
 
     @property
-    def is_low(self) -> bool:
-        return 0 < self.remaining < 100
+    def reset_datetime_utc(self) -> Optional[datetime]:
+        if not self.reset_epoch:
+            return None
+        try:
+            return datetime.fromtimestamp(self.reset_epoch, tz=timezone.utc)
+        except (ValueError, OSError):
+            return None
 
 
 @dataclass
 class RepoFileEntry:
-    """Metadata for a single file or directory in a GitHub repository."""
+    """Represents a file or directory node in a repository tree."""
 
     name: str
     path: str
@@ -69,16 +68,28 @@ class RepoFileEntry:
     html_url: str = ""
     download_url: Optional[str] = None
 
-    @property
-    def extension(self) -> str:
-        if "." not in self.name or self.item_type == "dir":
-            return ""
-        return "." + self.name.rsplit(".", 1)[-1].lower()
+
+@dataclass
+class FileContentResult:
+    """Result of fetching a single file from GitHub."""
+
+    repo_name: str
+    path: str
+    exists: bool
+    size: int = 0
+    sha: str = ""
+    raw_bytes: Optional[bytes] = None
+    text_content: Optional[str] = None
+    html_url: str = ""
+    last_modified: Optional[str] = None
+    is_binary: bool = False
+    too_large_for_preview: bool = False
+    error_message: Optional[str] = None
 
 
 @dataclass
 class CommitRecord:
-    """Summary of a single GitHub repository commit."""
+    """Summary of a repository commit."""
 
     sha: str
     short_sha: str
@@ -90,36 +101,13 @@ class CommitRecord:
 
 
 @dataclass
-class FileContentResult:
-    """Result of fetching a single file's content from GitHub."""
-
-    repo_name: str
-    path: str
-    exists: bool
-    size: int = 0
-    sha: str = ""
-    encoding: str = "utf-8"
-    text_content: Optional[str] = None
-    raw_bytes: Optional[bytes] = None
-    html_url: str = ""
-    last_modified: Optional[str] = None
-    too_large_for_preview: bool = False
-    is_binary: bool = False
-    error_message: Optional[str] = None
-
-
-@dataclass
 class RepositorySnapshot:
-    """
-    Isolated snapshot of a single team repository's metadata, convention files,
-    full directory tree, and recent commits.
-    """
+    """Complete fault-isolated snapshot of a single team repository."""
 
     org: str
     repo_name: str
     accessible: bool
     status_code: int = 200
-    error_message: Optional[str] = None
     description: Optional[str] = None
     private: bool = True
     default_branch: str = "main"
@@ -133,18 +121,13 @@ class RepositorySnapshot:
     recent_commits: List[CommitRecord] = field(default_factory=list)
     convention_raw_files: Dict[str, FileContentResult] = field(default_factory=dict)
     fetched_at_utc: str = field(
-        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     )
+    error_message: Optional[str] = None
 
 
 class GitHubAuthProvider:
-    """
-    Provides least-privilege Authorization headers for GitHub API requests.
-    Supports:
-    1. GitHub App Installation authentication (`app_id`, `installation_id`, `private_key_pem`)
-       using RS256 JWT generation via `cryptography` and automatic installation token caching.
-    2. Fine-Grained Personal Access Token (`token` / `PBL_GITHUB_TOKEN`).
-    """
+    """Provides bearer tokens via either a Fine-Grained PAT or a GitHub App installation."""
 
     def __init__(
         self,
@@ -166,11 +149,11 @@ class GitHubAuthProvider:
         self._installation_token_expiry_epoch: int = 0
 
     @classmethod
-    def from_secrets(cls, secrets_map: Optional[Dict] = None, config: Optional[DashboardConfig] = None) -> "GitHubAuthProvider":
-        """Construct a GitHubAuthProvider from Streamlit secrets or environment variables."""
-        import os
-
-        from src.config import to_plain_dict
+    def from_secrets(
+        cls,
+        secrets_map: Optional[Dict] = None,
+        config: Optional[DashboardConfig] = None,
+    ) -> "GitHubAuthProvider":
         plain = to_plain_dict(secrets_map) if secrets_map is not None else {}
         secrets_map = plain if isinstance(plain, dict) else {}
         gh_sec = secrets_map.get("github", {}) if isinstance(secrets_map.get("github"), dict) else {}
@@ -203,7 +186,6 @@ class GitHubAuthProvider:
         return self.auth_mode != "unconfigured"
 
     def _generate_app_jwt(self) -> str:
-        """Create a short-lived RS256 JWT (9 minutes) signed with the GitHub App's RSA private key."""
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -233,7 +215,6 @@ class GitHubAuthProvider:
         return f"{signing_input}.{_b64url(signature)}"
 
     def get_access_token(self, session: Optional[requests.Session] = None) -> str:
-        """Return a valid bearer token (either cached GitHub App installation token or fine-grained PAT)."""
         if self.auth_mode == "fine_grained_pat":
             return self._pat_token  # type: ignore[return-value]
 
@@ -271,15 +252,14 @@ class GitHubAuthProvider:
 
 
 class GitHubCohortClient:
-    """
-    Resilient GitHub API client for `PBL-Cohort-X-Teams-13-18`.
+    """Resilient GitHub API client for `PBL-Cohort-X-Teams-13-18`."""
 
-    Guarantees:
-    - Never throws an unhandled exception when an individual repository is missing,
-      private/unauthorized, empty, or contains malformed files.
-    - Tracks rate limits and prevents repeated hammering when rate-limited.
-    - Supports in-memory TTL caching with manual cache clearing.
-    """
+    ALLOWED_WRITE_PREFIXES: Tuple[str, ...] = (
+        "project/",
+        "team/",
+        "tasks/",
+        "reviews/",
+    )
 
     def __init__(
         self,
@@ -294,7 +274,6 @@ class GitHubCohortClient:
         self._cache: Dict[str, Tuple[float, Any]] = {}
 
     def clear_cache(self, repo_name: Optional[str] = None) -> None:
-        """Clear cached responses globally or for a single repository."""
         if repo_name is None:
             self._cache.clear()
         else:
@@ -342,11 +321,6 @@ class GitHubCohortClient:
         json_body: Optional[Dict[str, Any]] = None,
         accept: str = "application/vnd.github+json",
     ) -> Tuple[int, Any, Dict[str, Any], Optional[str]]:
-        """
-        Execute an authenticated GitHub API request with retries for transient 5xx errors
-        and explicit rate-limit handling.
-        Returns `(status_code, parsed_json_or_bytes, headers, error_message)`.
-        """
         if not self.auth.is_configured:
             return (
                 401,
@@ -382,7 +356,7 @@ class GitHubCohortClient:
             "Authorization": f"Bearer {token}",
             "Accept": accept,
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "PBL-Cohort-X-Mentor-Dashboard/1.0",
+            "User-Agent": "PBL-Cohort-X-Dashboard/2.0",
         }
 
         last_error = None
@@ -423,7 +397,7 @@ class GitHubCohortClient:
                         403,
                         None,
                         dict(resp.headers),
-                        "Insufficient GitHub permissions (HTTP 403): Verify repository read permissions for this token/App.",
+                        "Insufficient GitHub permissions (HTTP 403): Verify repository permissions for this token.",
                     )
 
                 if resp.status_code == 404:
@@ -457,7 +431,6 @@ class GitHubCohortClient:
         return 503, None, {}, f"Network error communicating with GitHub API: {last_error}"
 
     def verify_organization_connection(self) -> Dict[str, Any]:
-        """Verify authenticated access to the organization and return diagnostic summary."""
         status, data, _, err = self._request("GET", f"/orgs/{quote(self.config.github_org)}")
         if status == 200 and isinstance(data, dict):
             return {
@@ -479,11 +452,9 @@ class GitHubCohortClient:
             "rate_limit": self.rate_limit,
         }
 
-    def fetch_directory_contents(self, repo_name: str, folder_path: str = "", ref: Optional[str] = None) -> Tuple[List[RepoFileEntry], Optional[str]]:
-        """
-        Retrieve directory contents for `folder_path` inside `repo_name`.
-        Supports dynamic nested folders and custom folder names.
-        """
+    def fetch_directory_contents(
+        self, repo_name: str, folder_path: str = "", ref: Optional[str] = None
+    ) -> Tuple[List[RepoFileEntry], Optional[str]]:
         clean_path = folder_path.strip("/")
         cache_key = f"{repo_name.lower()}::dir::{clean_path}::{ref or 'default'}"
         cached = self._get_cached(cache_key)
@@ -514,7 +485,6 @@ class GitHubCohortClient:
                 )
             )
 
-        # Sort directories first, then alphabetically by name
         entries.sort(key=lambda e: (0 if e.item_type == "dir" else 1, e.name.lower()))
         self._set_cached(cache_key, entries)
         return entries, None
@@ -526,10 +496,6 @@ class GitHubCohortClient:
         ref: Optional[str] = None,
         max_bytes: int = MAX_PREVIEW_FILE_BYTES,
     ) -> FileContentResult:
-        """
-        Fetch and decode a single file's content from GitHub with size checks,
-        binary detection, and error isolation.
-        """
         clean_path = file_path.strip("/")
         cache_key = f"{repo_name.lower()}::file::{clean_path}::{ref or 'default'}"
         cached = self._get_cached(cache_key)
@@ -602,7 +568,6 @@ class GitHubCohortClient:
         elif size == 0:
             raw_bytes = b""
         else:
-            # If GitHub omitted base64 content (e.g. file near 1MB), try raw accept header
             raw_status, raw_body, _, raw_err = self._request(
                 "GET",
                 endpoint,
@@ -623,7 +588,6 @@ class GitHubCohortClient:
                     error_message=raw_err or "File content could not be retrieved inline; use the direct GitHub link.",
                 )
 
-        # Detect binary vs UTF-8 text
         is_binary = b"\x00" in raw_bytes[:8192]
         text_content: Optional[str] = None
         if not is_binary:
@@ -650,8 +614,9 @@ class GitHubCohortClient:
         self._set_cached(cache_key, res)
         return res
 
-    def fetch_recent_commits(self, repo_name: str, branch: Optional[str] = None, max_commits: int = 15) -> Tuple[List[CommitRecord], Optional[str]]:
-        """Fetch recent commits with pagination support."""
+    def fetch_recent_commits(
+        self, repo_name: str, branch: Optional[str] = None, max_commits: int = 15
+    ) -> Tuple[List[CommitRecord], Optional[str]]:
         cache_key = f"{repo_name.lower()}::commits::{branch or 'default'}::{max_commits}"
         cached = self._get_cached(cache_key)
         if cached is not None:
@@ -667,7 +632,6 @@ class GitHubCohortClient:
         while len(commits) < max_commits:
             status, data, _, err = self._request("GET", endpoint, params=params)
             if status == 409:
-                # 409 Conflict from GitHub means the repository is empty (0 commits)
                 break
             if status != 200 or not isinstance(data, list):
                 return commits, err
@@ -708,13 +672,8 @@ class GitHubCohortClient:
 
     def fetch_repository_snapshot(self, repo_name: str, force_refresh: bool = False) -> RepositorySnapshot:
         """
-        Retrieve a complete, fault-isolated snapshot of `repo_name`:
-        1. Basic repository metadata (default branch, privacy, last push).
-        2. Recursive Git tree (`GET /repos/{org}/{repo}/git/trees/{branch}?recursive=1`)
-           so all custom folders, nested files, and convention files are discovered in 1 API call.
-        3. Recent commits.
-        4. Convention metadata files (`project/*.json`, `team/*.json`, `tasks/*.json`, `reviews/*.json`, `README.md`)
-           only for files that actually exist in the repository tree (avoiding unnecessary 404 requests!).
+        Retrieve a complete, fault-isolated snapshot of `repo_name`, fetching existing
+        convention files in parallel for fast startup.
         """
         if force_refresh:
             self.clear_cache(repo_name)
@@ -729,7 +688,7 @@ class GitHubCohortClient:
         default_repo_url = f"https://github.com/{self.config.github_org}/{repo_name}"
 
         if status != 200 or not isinstance(repo_data, dict):
-            snap = RepositorySnapshot(
+            return RepositorySnapshot(
                 org=self.config.github_org,
                 repo_name=repo_name,
                 accessible=False,
@@ -737,12 +696,10 @@ class GitHubCohortClient:
                 error_message=err or f"Unable to access repository '{repo_name}' (HTTP {status}).",
                 html_url=default_repo_url,
             )
-            return snap
 
         default_branch = str(repo_data.get("default_branch") or "main")
         html_url = str(repo_data.get("html_url") or default_repo_url)
 
-        # Fetch recursive git tree to discover all folders/files in a single API call
         tree_entries: List[RepoFileEntry] = []
         tree_truncated = False
         existing_paths: Dict[str, RepoFileEntry] = {}
@@ -771,14 +728,12 @@ class GitHubCohortClient:
                 tree_entries.append(entry)
                 existing_paths[path_str.lower()] = entry
 
-        # Fetch recent commits
         recent_commits, _ = self.fetch_recent_commits(repo_name, branch=default_branch, max_commits=15)
 
-        # Fetch convention files that exist in the tree (plus any additional review-*.json files in reviews/)
         convention_results: Dict[str, FileContentResult] = {}
-        for key, rel_path in CONVENTION_FILES.items():
+        paths_to_fetch: List[str] = []
+        for _, rel_path in CONVENTION_FILES.items():
             if existing_paths and rel_path.lower() not in existing_paths:
-                # We know from the recursive tree that the file does not exist; record missing without wasting an API call
                 convention_results[rel_path] = FileContentResult(
                     repo_name=repo_name,
                     path=rel_path,
@@ -787,17 +742,35 @@ class GitHubCohortClient:
                     error_message="File not present in repository.",
                 )
             else:
-                convention_results[rel_path] = self.fetch_file_content(repo_name, rel_path, ref=default_branch)
+                paths_to_fetch.append(rel_path)
 
-        # Also dynamically discover any extra review files matching `reviews/review-*.json`
         for entry in tree_entries:
             if (
                 entry.item_type == "file"
                 and entry.path.lower().startswith("reviews/")
                 and entry.path.lower().endswith(".json")
                 and entry.path not in convention_results
+                and entry.path not in paths_to_fetch
             ):
-                convention_results[entry.path] = self.fetch_file_content(repo_name, entry.path, ref=default_branch)
+                paths_to_fetch.append(entry.path)
+
+        if paths_to_fetch:
+            with ThreadPoolExecutor(max_workers=min(6, len(paths_to_fetch))) as pool:
+                future_map = {
+                    p: pool.submit(self.fetch_file_content, repo_name, p, default_branch)
+                    for p in paths_to_fetch
+                }
+                for p, fut in future_map.items():
+                    try:
+                        convention_results[p] = fut.result()
+                    except Exception as exc:
+                        convention_results[p] = FileContentResult(
+                            repo_name=repo_name,
+                            path=p,
+                            exists=False,
+                            html_url=f"{html_url}/blob/{default_branch}/{p}",
+                            error_message=redact_secrets(str(exc)),
+                        )
 
         snap = RepositorySnapshot(
             org=self.config.github_org,
@@ -820,100 +793,76 @@ class GitHubCohortClient:
         self._set_cached(cache_key, snap)
         return snap
 
-    def commit_review_file(
-        self,
-        repo_name: str,
-        file_path: str,
-        json_payload: Dict[str, Any],
-        commit_message: str,
-        branch: Optional[str] = None,
-    ) -> Tuple[bool, str]:
-        """
-        Explicitly write a validated review JSON record back to GitHub ONLY when
-        `config.enable_github_writeback` is True and invoked by an authorized mentor/owner.
-        Never overwrites student files silently.
-        """
-        if not self.config.enable_github_writeback:
-            return (
-                False,
-                "GitHub write-back is disabled in configuration (`enable_github_writeback = false`). "
-                "Feedback has been saved to the local mentor database instead.",
-            )
-
-        clean_path = file_path.strip("/")
-        if not clean_path.startswith("reviews/") or not clean_path.endswith(".json"):
-            return (
-                False,
-                "Write-back is strictly restricted to `reviews/*.json` files to prevent overwriting student project files.",
-            )
-
-        existing = self.fetch_file_content(repo_name, clean_path, ref=branch)
-        encoded_content = base64.b64encode(
-            json.dumps(json_payload, indent=2, ensure_ascii=False).encode("utf-8")
-        ).decode("ascii")
-
-        body: Dict[str, Any] = {
-            "message": commit_message,
-            "content": encoded_content,
-        }
-        if branch:
-            body["branch"] = branch
-        if existing.exists and existing.sha:
-            body["sha"] = existing.sha
-
-        encoded_path = "/".join(quote(seg) for seg in clean_path.split("/") if seg)
-        endpoint = f"/repos/{quote(self.config.github_org)}/{quote(repo_name)}/contents/{encoded_path}"
-        status, _, _, err = self._request("PUT", endpoint, json_body=body)
-        if status in (200, 201):
-            self.clear_cache(repo_name)
-            return True, f"Successfully committed `{clean_path}` to `{repo_name}`."
-        return False, err or f"Failed to commit `{clean_path}` (HTTP {status})."
-
     def commit_structured_json(
         self,
         repo_name: str,
         file_path: str,
         json_payload: Dict[str, Any],
         commit_message: str,
-        branch: Optional[str] = None,
+        branch: str = "main",
     ) -> Tuple[bool, str]:
         """
-        Explicitly commit a validated structured metadata JSON file (`project/*.json`,
-        `team/*.json`, `tasks/tasks.json`, or `reviews/*.json`) to GitHub so both the
-        Team 16 Dashboard and the Mentor Dashboard receive updates simultaneously.
+        Create or update a structured JSON file under `project/`, `team/`, `tasks/`, or `reviews/`
+        directly in `repo_name` via the GitHub Contents API (`PUT /repos/{org}/{repo}/contents/{path}`).
         """
         if not self.config.enable_github_writeback:
             return (
                 False,
-                "GitHub write-back is disabled (`enable_github_writeback = false`). Set it to `true` in `.streamlit/secrets.toml`.",
+                "GitHub writeback is disabled (`enable_github_writeback = false` in Secrets).",
             )
 
         clean_path = file_path.strip("/")
-        allowed_prefixes = ("project/", "team/", "tasks/", "reviews/")
-        if not clean_path.startswith(allowed_prefixes) or not clean_path.endswith(".json"):
+        if not clean_path.endswith(".json") or not any(
+            clean_path.startswith(prefix) for prefix in self.ALLOWED_WRITE_PREFIXES
+        ):
             return (
                 False,
-                "Write-back is restricted to structured JSON files inside `project/`, `team/`, `tasks/`, and `reviews/`.",
+                f"Writeback is restricted to JSON files under {self.ALLOWED_WRITE_PREFIXES}. Rejected path: `{clean_path}`.",
             )
-
-        existing = self.fetch_file_content(repo_name, clean_path, ref=branch)
-        encoded_content = base64.b64encode(
-            json.dumps(json_payload, indent=2, ensure_ascii=False).encode("utf-8")
-        ).decode("ascii")
-
-        body: Dict[str, Any] = {
-            "message": commit_message,
-            "content": encoded_content,
-        }
-        if branch:
-            body["branch"] = branch
-        if existing.exists and existing.sha:
-            body["sha"] = existing.sha
 
         encoded_path = "/".join(quote(seg) for seg in clean_path.split("/") if seg)
         endpoint = f"/repos/{quote(self.config.github_org)}/{quote(repo_name)}/contents/{encoded_path}"
-        status, _, _, err = self._request("PUT", endpoint, json_body=body)
-        if status in (200, 201):
+
+        existing_sha: Optional[str] = None
+        get_status, get_data, _, _ = self._request("GET", endpoint, params={"ref": branch})
+        if get_status == 200 and isinstance(get_data, dict):
+            existing_sha = get_data.get("sha")
+
+        formatted_json = json.dumps(json_payload, indent=2, ensure_ascii=False) + "\n"
+        b64_content = base64.b64encode(formatted_json.encode("utf-8")).decode("ascii")
+
+        body: Dict[str, Any] = {
+            "message": commit_message,
+            "content": b64_content,
+            "branch": branch,
+        }
+        if existing_sha:
+            body["sha"] = existing_sha
+
+        put_status, _, _, put_err = self._request("PUT", endpoint, json_body=body)
+        if put_status in (200, 201):
             self.clear_cache(repo_name)
-            return True, f"Successfully committed `{clean_path}` to `{repo_name}` on GitHub."
-        return False, err or f"Failed to commit `{clean_path}` (HTTP {status})."
+            action_word = "Updated" if existing_sha else "Created"
+            return True, f"{action_word} `{clean_path}` in `{repo_name}` (`{branch}`)."
+
+        return (
+            False,
+            put_err or f"Failed to commit `{clean_path}` to `{repo_name}` (HTTP {put_status}).",
+        )
+
+    def commit_review_file(
+        self,
+        repo_name: str,
+        file_path: str,
+        json_payload: Dict[str, Any],
+        commit_message: str,
+        branch: str = "main",
+    ) -> Tuple[bool, str]:
+        """Backwards-compatible wrapper around `commit_structured_json` for review files."""
+        return self.commit_structured_json(
+            repo_name=repo_name,
+            file_path=file_path,
+            json_payload=json_payload,
+            commit_message=commit_message,
+            branch=branch,
+        )

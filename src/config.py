@@ -97,6 +97,23 @@ def to_plain_dict(obj: Any) -> Any:
     return obj
 
 
+def format_repo_display_name(repo_name: str) -> str:
+    """Convert a repository slug like `pbl-team-16` into a clean display title like `PBL Team 16`."""
+    slug = (repo_name or "").strip()
+    if not slug:
+        return "PBL Team"
+    parts = slug.replace("_", "-").split("-")
+    formatted: List[str] = []
+    for part in parts:
+        if part.lower() == "pbl":
+            formatted.append("PBL")
+        elif part.isdigit():
+            formatted.append(part)
+        else:
+            formatted.append(part.capitalize())
+    return " ".join(formatted)
+
+
 @dataclass(frozen=True)
 class ReviewDefinition:
     """Configuration for a cohort review stage."""

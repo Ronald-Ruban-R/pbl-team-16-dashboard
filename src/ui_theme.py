@@ -1,8 +1,10 @@
 """
-Clean UI theme and layout helpers for the PBL Mentor & Team Dashboards.
+Unified Visual Theme, Status Badges & Consistent Spacing (`src/ui_theme.py`).
 
-Applies consistent spacing, subtle card elevation, compact metric typography,
-and organized tab navigation to eliminate visual clutter without removing any features.
+Provides:
+- Clean, consistent spacing, card borders, metric styling, and tab bar hierarchy.
+- Standardized status indicator helpers so icons are used only for navigation and
+  meaningful status indicators with uniform style across every view.
 """
 
 from __future__ import annotations
@@ -10,49 +12,89 @@ from __future__ import annotations
 import streamlit as st
 
 
+def format_health_badge(status: str) -> str:
+    """Return a consistent status indicator string for team health."""
+    s = (status or "").strip()
+    if s == "On Track":
+        return "🟢 On Track"
+    if s == "Needs Attention":
+        return "🟡 Needs Attention"
+    if s == "At Risk":
+        return "🔴 At Risk"
+    return f"⚪ {s or 'Unknown'}"
+
+
+def format_task_status(status: str) -> str:
+    """Return a consistent, scannable indicator for task and milestone statuses."""
+    s = (status or "").strip()
+    mapping = {
+        "Completed": "● Completed",
+        "In Progress": "◐ In Progress",
+        "Not Started": "○ Not Started",
+        "Blocked": "▲ Blocked",
+        "Delayed": "▲ Delayed",
+    }
+    return mapping.get(s, s or "○ Not Started")
+
+
+def format_bool_indicator(value: bool, true_label: str = "Verified", false_label: str = "Missing") -> str:
+    """Return a uniform `✓` / `✕` indicator string for verification tables."""
+    return f"✓ {true_label}" if value else f"✕ {false_label}"
+
+
 def apply_clean_theme() -> None:
-    """Inject clean, non-intrusive CSS rules for spacing, cards, metrics, and tabs."""
+    """Inject clean, consistent CSS styling for cards, metrics, tabs, and tables."""
     st.markdown(
         """
         <style>
-        /* Reduce excessive top padding while keeping breathing room */
+        /* Main container spacing */
         .block-container {
             padding-top: 1.5rem !important;
             padding-bottom: 2.5rem !important;
-            max-width: 1380px !important;
+            max-width: 1440px;
         }
 
-        /* Clean metric cards */
+        /* Consistent typography hierarchy */
+        h1, h2, h3 {
+            letter-spacing: -0.015em;
+            font-weight: 600;
+        }
+        h2 {
+            margin-bottom: 0.25rem !important;
+        }
+        h4 {
+            margin-top: 0.5rem !important;
+            margin-bottom: 0.6rem !important;
+            font-weight: 600;
+        }
+
+        /* Polished metric cards */
         div[data-testid="stMetric"] {
-            background-color: rgba(128, 128, 128, 0.06);
+            background-color: rgba(128, 128, 128, 0.05);
             border: 1px solid rgba(128, 128, 128, 0.16);
             border-radius: 10px;
-            padding: 12px 16px;
+            padding: 0.75rem 1rem;
         }
-        div[data-testid="stMetricLabel"] > div {
+        div[data-testid="stMetricLabel"] {
             font-size: 0.82rem !important;
-            font-weight: 600 !important;
-            opacity: 0.82;
+            font-weight: 500 !important;
+            opacity: 0.85;
         }
-        div[data-testid="stMetricValue"] > div {
+        div[data-testid="stMetricValue"] {
             font-size: 1.45rem !important;
-            font-weight: 700 !important;
-        }
-
-        /* Clean tab bar styling with generous spacing */
-        button[data-baseweb="tab"] {
             font-weight: 600 !important;
-            padding: 10px 18px !important;
         }
 
-        /* Subtle container borders */
+        /* Clean, uniform tab bar styling */
+        button[data-baseweb="tab"] {
+            font-weight: 500 !important;
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+        }
+
+        /* Subtle bordered containers */
         div[data-testid="stVerticalBlockBorderWrapper"] {
             border-radius: 10px !important;
-        }
-
-        /* Compact dataframe headers */
-        .stDataFrame {
-            border-radius: 8px;
         }
         </style>
         """,

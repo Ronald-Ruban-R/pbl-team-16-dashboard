@@ -12,13 +12,14 @@ multiple instances from the same repository.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Dict, List
 
 import streamlit as st
 
 from src.analytics import TeamEvaluationSummary, evaluate_team_repository
-from src.config import DashboardConfig, to_plain_dict
+from src.config import DashboardConfig, format_repo_display_name, to_plain_dict
 from src.github_client import GitHubAuthProvider, GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser
 from src.storage import MentorLocalStore
@@ -34,7 +35,7 @@ from src.views.timeline import render_timeline_page
 
 
 def _get_navigation_pages(is_single_team: bool) -> List[str]:
-    """Return appropriate navigation options based on whether this is a single team or cohort app."""
+    """Return navigation options based on whether this is a single team or cohort app."""
     if is_single_team:
         return [
             "Team Workspace & Profile",
@@ -133,11 +134,11 @@ def _render_login_screen(
     access_manager: AccessControlManager,
     local_store: MentorLocalStore,
     config: DashboardConfig,
-    team_label: str,
+    dashboard_title: str,
 ) -> None:
-    st.markdown(f"## PBL {team_label} Dashboard — Sign In")
+    st.markdown(f"## {dashboard_title} — Sign In")
     st.caption(
-        f"Organization: `{config.github_org}` | Configured Repositories: `{', '.join(config.team_repos)}`"
+        f"Organization: `{config.github_org}` · Configured Repositories: `{', '.join(config.team_repos)}`"
     )
 
     if not access_manager.is_auth_configured():
@@ -154,8 +155,8 @@ def _render_login_screen(
     col_left, col_center, col_right = st.columns([1, 1.4, 1])
     with col_center:
         with st.form("universal_login_form", clear_on_submit=False):
-            st.markdown(f"#### {team_label} Sign In")
-            username = st.text_input("Username", placeholder="RONALDRUBAN")
+            st.markdown(f"#### {dashboard_title}")
+            username = st.text_input("Username", placeholder="Enter username")
             password = st.text_input("Password", type="password")
             submitted = st.form_submit_button("Sign In", use_container_width=True)
 
@@ -200,17 +201,38 @@ def _load_authorized_team_evaluations(
     return evaluations
 
 
+def _safe_invoke_view(func: Any, **kwargs: Any) -> None:
+    """Invoke a view function matching only the keyword parameters accepted by its current signature."""
+    try:
+        sig = inspect.signature(func)
+        accepted_kwargs = {}
+        for param_name, param in sig.parameters.items():
+            if param_name in kwargs:
+                accepted_kwargs[param_name] = kwargs[param_name]
+            elif param.kind == inspect.Parameter.VAR_KEYWORD:
+                accepted_kwargs = kwargs
+                break
+        func(**accepted_kwargs)
+    except Exception as exc:
+        st.error(f"Error rendering view `{func.__name__}`: {exc}")
+
+
 def main() -> None:
     secrets_map = _load_streamlit_secrets()
     config, access_manager, github_client, local_store = _get_or_init_services(secrets_map)
 
     is_single_team = len(config.team_repos) == 1
-    team_label = config.team_repos[0].upper() if is_single_team else "Cohort-X"
+    dashboard_title = (
+        f"{format_repo_display_name(config.team_repos[0])} Dashboard"
+        if is_single_team
+        else "PBL Cohort-X Mentor Dashboard"
+    )
     nav_pages = _get_navigation_pages(is_single_team)
     st.session_state["_nav_options"] = nav_pages
 
     st.set_page_config(
-        page_title=f"PBL {team_label} Dashboard",
+        page_title=dashboard_title,
+        page_icon="🧭",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -218,14 +240,15 @@ def main() -> None:
 
     user: AuthenticatedUser | None = st.session_state.get("authenticated_user")
     if user is None:
-        _render_login_screen(access_manager, local_store, config, team_label)
+        _render_login_screen(access_manager, local_store, config, dashboard_title)
         return
 
     with st.sidebar:
-        st.markdown(f"### PBL {team_label}")
+        st.markdown(f"### 🧭 {dashboard_title}")
         st.caption(f"Repo: `{config.github_org}/{', '.join(config.team_repos)}`")
         access_badge = "Write Access (Owner)" if user.role.value == "owner" else "Read-Only"
-        st.markdown(f"**{user.display_name}** (`{user.role.value}` — {access_badge})")
+        st.markdown(f"**{user.display_name}**  \n`{user.role.value}` · {access_badge}")
+        st.divider()
 
         if "active_page" not in st.session_state or st.session_state["active_page"] not in nav_pages:
             st.session_state["active_page"] = nav_pages[0]
@@ -246,8 +269,8 @@ def main() -> None:
         else:
             rl = github_client.rate_limit
             st.caption(
-                f"GitHub Auth: `{github_client.auth.auth_mode}`\n\n"
-                f"API Quota: **{rl.remaining:,}/{rl.limit:,}**"
+                f"GitHub Auth: `{github_client.auth.auth_mode}`  \n"
+                f"API Quota: **{rl.remaining:,} / {rl.limit:,}**"
             )
 
         c_ref, c_out = st.columns(2)
@@ -269,27 +292,73 @@ def main() -> None:
 
     active_page = st.session_state["active_page"]
     if active_page in ("Team Workspace & Profile", "Team 16 Workspace & Profile", "Individual Team Workspace"):
-        render_team_workspace_page(
-            evaluations, user, access_manager, github_client=github_client, local_store=local_store
+        _safe_invoke_view(
+            render_team_workspace_page,
+            evaluations=evaluations,
+            user=user,
+            access_manager=access_manager,
+            github_client=github_client,
+            local_store=local_store,
         )
     elif active_page in ("Tasks, Progress & Live GitHub Sync", "Progress & Tasks"):
-        render_tasks_progress_page(
-            evaluations, user, access_manager, local_store, github_client=github_client, config=config
+        _safe_invoke_view(
+            render_tasks_progress_page,
+            evaluations=evaluations,
+            user=user,
+            access_manager=access_manager,
+            local_store=local_store,
+            github_client=github_client,
+            config=config,
         )
     elif active_page == "Repository Explorer":
-        render_repo_explorer_page(evaluations, github_client, user, access_manager)
+        _safe_invoke_view(
+            render_repo_explorer_page,
+            evaluations=evaluations,
+            github_client=github_client,
+            user=user,
+            access_manager=access_manager,
+        )
     elif active_page in ("Reviews & Mentor Feedback", "Reviews & Feedback"):
-        render_reviews_page(evaluations, config, github_client, user, access_manager, local_store)
+        _safe_invoke_view(
+            render_reviews_page,
+            evaluations=evaluations,
+            config=config,
+            github_client=github_client,
+            user=user,
+            access_manager=access_manager,
+            local_store=local_store,
+        )
     elif active_page in ("Timeline & Milestones",):
-        render_timeline_page(
-            evaluations, user, access_manager, github_client=github_client, local_store=local_store
+        _safe_invoke_view(
+            render_timeline_page,
+            evaluations=evaluations,
+            user=user,
+            access_manager=access_manager,
+            github_client=github_client,
+            local_store=local_store,
         )
     elif active_page in ("Research & Competitions",):
-        render_research_competitions_page(evaluations, user, access_manager)
+        _safe_invoke_view(
+            render_research_competitions_page,
+            evaluations=evaluations,
+            user=user,
+            access_manager=access_manager,
+        )
     elif active_page in ("Overview & Alerts", "Overview & Cohort Comparison"):
-        render_overview_page(evaluations, config)
+        _safe_invoke_view(
+            render_overview_page,
+            evaluations=evaluations,
+            config=config,
+        )
     elif active_page == "Settings & Diagnostics":
-        render_settings_page(evaluations, config, github_client, user, local_store)
+        _safe_invoke_view(
+            render_settings_page,
+            evaluations=evaluations,
+            config=config,
+            github_client=github_client,
+            user=user,
+            local_store=local_store,
+        )
 
 
 if __name__ == "__main__":
