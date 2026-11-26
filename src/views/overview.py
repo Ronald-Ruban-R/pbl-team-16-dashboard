@@ -2,10 +2,10 @@
 Cohort & Team Overview View (`src/views/overview.py`).
 
 Organized into four clean, consistent tabs:
-1. `Team Cards`: Scannable status cards with quick workspace navigation.
-2. `Comparison Matrix`: Searchable, filterable cohort-wide status table.
+1. `Team Cards`: Scannable status cards with semantic health pills and quick workspace navigation.
+2. `Comparison Matrix`: Searchable, filterable cohort-wide status table with visual progress columns.
 3. `Progress Charts`: Dual Reported vs. Verified progress and task breakdown charts.
-4. `Alerts & Warnings`: Prioritized governance alerts and JSON validation diagnostics.
+4. `Alerts & Validation`: Prioritized governance alerts and JSON validation diagnostics.
 """
 
 from __future__ import annotations
@@ -19,7 +19,12 @@ import streamlit as st
 
 from src.analytics import TeamEvaluationSummary
 from src.config import DashboardConfig
-from src.ui_theme import format_health_badge
+from src.ui_theme import (
+    format_health_badge,
+    render_health_pill,
+    render_page_header,
+    style_plotly_figure,
+)
 
 
 def render_overview_page(
@@ -28,9 +33,9 @@ def render_overview_page(
 ) -> None:
     """Render the Cohort / Team Overview page."""
     is_single = len(evaluations) == 1
-    st.markdown("## Team Overview & Health Summary" if is_single else "## Cohort Overview & Team Comparison")
-    st.caption(
-        "Real-time repository health, reported vs. verified progress, and automated governance checks."
+    render_page_header(
+        title="Team Overview & Health Summary" if is_single else "Cohort Overview & Team Comparison",
+        subtitle="Real-time repository health, reported vs. verified progress, and automated governance checks.",
     )
 
     if not evaluations:
@@ -74,13 +79,13 @@ def render_overview_page(
                 ev = evaluations[repo_name]
                 with row_cols[col_idx]:
                     with st.container(border=True):
-                        h_col1, h_col2 = st.columns([2.2, 1])
+                        h_col1, h_col2 = st.columns([2.3, 1])
                         with h_col1:
                             st.markdown(f"#### {ev.display_team_name}")
                             project_title = (
                                 ev.metadata.project_title
                                 if ev.metadata and ev.metadata.project_title
-                                else "Project Title Not Set"
+                                else f"{ev.display_team_name} Project"
                             )
                             domain_label = (
                                 ev.metadata.domain
@@ -90,8 +95,8 @@ def render_overview_page(
                             st.caption(f"`{repo_name}` · {domain_label} · {project_title}")
                         with h_col2:
                             st.markdown(
-                                f"<div style='text-align:right; font-weight:600; padding-top:4px;'>"
-                                f"{format_health_badge(ev.health_status)}</div>",
+                                f"<div style='display:flex;justify-content:flex-end;padding-top:4px;'>"
+                                f"{render_health_pill(ev.health_status)}</div>",
                                 unsafe_allow_html=True,
                             )
 
@@ -115,13 +120,13 @@ def render_overview_page(
                             text=f"Verified Completion: {ev.verified_progress_pct:.1f}%",
                         )
 
-                        b_col1, b_col2 = st.columns([1.4, 1])
+                        b_col1, b_col2 = st.columns([1.5, 1])
                         with b_col1:
                             phase_str = ev.progress.current_phase if ev.progress else "Phase Not Reported"
                             st.caption(f"Phase: **{phase_str}** · Members: **{len(ev.members)}**")
                         with b_col2:
                             if st.button(
-                                f"Open {repo_name}",
+                                f"Open {ev.display_team_name}",
                                 key=f"open_ws_{repo_name}",
                                 use_container_width=True,
                             ):
@@ -145,7 +150,7 @@ def render_overview_page(
                 {
                     "Repository": repo_name,
                     "Team Name": ev.display_team_name,
-                    "Domain": ev.metadata.domain if ev.metadata else "Not Specified",
+                    "Domain": ev.metadata.domain if ev.metadata else "General Engineering & Innovation",
                     "Health": format_health_badge(ev.health_status),
                     "Verified (%)": ev.verified_progress_pct,
                     "Reported (%)": ev.reported_progress_pct,
@@ -159,7 +164,19 @@ def render_overview_page(
                     ),
                 }
             )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Verified (%)": st.column_config.ProgressColumn(
+                    "Verified (%)", min_value=0, max_value=100, format="%.1f%%"
+                ),
+                "Reported (%)": st.column_config.ProgressColumn(
+                    "Reported (%)", min_value=0, max_value=100, format="%.1f%%"
+                ),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Tab 3: Progress Charts
@@ -201,11 +218,8 @@ def render_overview_page(
                 fig.update_layout(
                     barmode="group",
                     yaxis=dict(range=[0, 105], title="Completion (%)"),
-                    margin=dict(l=20, r=20, t=20, b=20),
-                    height=340,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(style_plotly_figure(fig, height=340), use_container_width=True)
 
             with c2:
                 st.markdown("#### Task Status Distribution")
@@ -248,12 +262,7 @@ def render_overview_page(
                         "Not Started": "#94A3B8",
                     },
                 )
-                fig2.update_layout(
-                    margin=dict(l=20, r=20, t=20, b=20),
-                    height=340,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(style_plotly_figure(fig2, height=340), use_container_width=True)
 
     # ------------------------------------------------------------------
     # Tab 4: Alerts & Schema Diagnostics

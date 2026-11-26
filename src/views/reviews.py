@@ -696,7 +696,7 @@ def _render_review_json_editor(
             else next((d for d in deliv_list if d["title"] == pick_d), None)
         )
 
-        with st.form(f"rev_deliv_form_{selected_repo}_{selected_rev_num}"):
+        with st.form(f"rev_deliv_form_{selected_repo}_{selected_rev_num}_{pick_d}"):
             d_title = st.text_input("Deliverable Title", value=sel_d["title"] if sel_d else "")
             c1, c2, c3 = st.columns([1, 1, 2])
             d_req = c1.checkbox("Required Deliverable", value=bool(sel_d["required"]) if sel_d else True)
@@ -809,7 +809,7 @@ def _render_review_json_editor(
             else next((a for a in ai_list if a["action_id"] == pick_ai), None)
         )
 
-        with st.form(f"rev_ai_form_{selected_repo}_{selected_rev_num}"):
+        with st.form(f"rev_ai_form_{selected_repo}_{selected_rev_num}_{pick_ai}"):
             c1, c2, c3 = st.columns([1, 1.5, 1.2])
             a_id = c1.text_input(
                 "Action ID",

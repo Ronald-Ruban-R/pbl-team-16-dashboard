@@ -37,11 +37,20 @@ CONVENTION_FILES: Dict[str, str] = {
 
 # Standard recommended folders for categorizing repository artifacts dynamically
 RECOMMENDED_CATEGORY_FOLDERS: Dict[str, Tuple[str, ...]] = {
-    "Research & Literature": ("research", "literature", "papers", "references"),
-    "Technical Documentation": ("documentation", "docs", "architecture", "specs", "design"),
+    "Research & Literature": (
+        "research",
+        "literature",
+        "litrature-survey",
+        "literature-survey",
+        "induvidual-research",
+        "individual-research",
+        "papers",
+        "references",
+    ),
+    "Technical Documentation": ("documentation", "docs", "architecture", "specs", "design", "src"),
     "Datasets & Experiments": ("datasets", "data", "experiments", "notebooks", "results"),
     "Competitions & Achievements": ("competitions", "hackathons", "awards", "certificates"),
-    "Meeting Notes & Reports": ("meeting-notes", "meetings", "notes", "reports", "minutes"),
+    "Meeting Notes & Reports": ("mom", "meeting-notes", "meetings", "notes", "reports", "minutes"),
     "Deliverables & Releases": ("deliverables", "submissions", "presentations", "prototypes"),
     "Project Management": ("project", "team", "tasks", "reviews"),
 }

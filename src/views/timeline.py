@@ -212,9 +212,13 @@ def _render_timeline_editor(
         )
         sel_event = next((e for e in existing_events if e["event_id"] == chosen_id), None)
 
-    default_id = sel_event["event_id"] if sel_event else f"E{len(existing_events) + 1}"
+    if sel_event:
+        default_id = sel_event["event_id"]
+    else:
+        e_nums = [int("".join(c for c in e["event_id"] if c.isdigit())) for e in existing_events if any(c.isdigit() for c in e["event_id"])]
+        default_id = f"E{(max(e_nums) + 1) if e_nums else 1}"
 
-    with st.form(f"tl_editor_form_{selected_repo}"):
+    with st.form(f"tl_editor_form_{selected_repo}_{mode}_{default_id}"):
         c1, c2, c3 = st.columns([1, 2.5, 1.2])
         e_id = c1.text_input("Event ID", value=default_id)
         e_title = c2.text_input(

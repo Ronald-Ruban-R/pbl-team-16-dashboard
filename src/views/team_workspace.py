@@ -14,7 +14,7 @@ Organized into 6 clean, consistent tabs:
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Dict
 
 import pandas as pd
 import streamlit as st
@@ -24,7 +24,12 @@ from src.config import CONVENTION_FILES, format_repo_display_name
 from src.github_client import GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser, sanitize_markdown_for_display
 from src.storage import MentorLocalStore
-from src.ui_theme import format_bool_indicator, format_health_badge, format_task_status
+from src.ui_theme import (
+    format_bool_indicator,
+    format_task_status,
+    render_health_pill,
+    render_page_header,
+)
 
 
 def render_team_workspace_page(
@@ -45,7 +50,7 @@ def render_team_workspace_page(
         default_repo = authorized_repos[0]
 
     if len(authorized_repos) > 1:
-        top_col1, top_col2 = st.columns([3, 1])
+        top_col1, _ = st.columns([2.5, 1])
         with top_col1:
             selected_repo = st.selectbox(
                 "Select Team Workspace",
@@ -61,29 +66,24 @@ def render_team_workspace_page(
     access_manager.authorize_repo_access(user, selected_repo)
     ev = evaluations[selected_repo]
 
-    h_col1, h_col2 = st.columns([3, 1])
-    with h_col1:
-        st.markdown(f"## {ev.display_team_name}")
-        domain_str = (
-            ev.metadata.domain
-            if ev.metadata and ev.metadata.domain
-            else "General Engineering & Innovation"
-        )
-        title_str = (
-            ev.metadata.project_title
-            if ev.metadata and ev.metadata.project_title
-            else f"{ev.display_team_name} Project"
-        )
-        st.caption(
+    domain_str = (
+        ev.metadata.domain
+        if ev.metadata and ev.metadata.domain
+        else "General Engineering & Innovation"
+    )
+    title_str = (
+        ev.metadata.project_title
+        if ev.metadata and ev.metadata.project_title
+        else f"{ev.display_team_name} Project"
+    )
+    render_page_header(
+        title=ev.display_team_name,
+        subtitle=(
             f"Repository: [`{ev.snapshot.org}/{selected_repo}`]({ev.snapshot.html_url}) · "
             f"Domain: **{domain_str}** · Project: **{title_str}**"
-        )
-    with h_col2:
-        st.markdown(
-            f"<div style='text-align:right; font-weight:600; font-size:1.05rem; padding-top:0.6rem;'>"
-            f"{format_health_badge(ev.health_status)}</div>",
-            unsafe_allow_html=True,
-        )
+        ),
+        right_badge_html=render_health_pill(ev.health_status),
+    )
 
     if not ev.snapshot.accessible:
         st.error(f"Repository `{selected_repo}` is unavailable: {ev.snapshot.error_message}")
@@ -191,13 +191,21 @@ def render_team_workspace_page(
             ]
             st.dataframe(pd.DataFrame(resp_rows), use_container_width=True, hide_index=True)
         else:
-            st.info("No responsibility records configured in `team/responsibilities.json` yet.")
+            resp_issues = [v for v in ev.validation_issues if "responsibilities.json" in v.file_path]
+            if resp_issues:
+                for vi in resp_issues:
+                    st.warning(f"`{vi.file_path}`: {vi.message}")
+            else:
+                st.info(
+                    "No responsibility records configured in `team/responsibilities.json` yet. "
+                    "If you just updated the file on GitHub, click **Sync Now** in the sidebar to refresh the cache."
+                )
 
     # ------------------------------------------------------------------
     # Tab 2: Weekly Progress Updates, Milestones & Recent Commits
     # ------------------------------------------------------------------
     with tab_updates:
-        u_col1, u_col2 = st.columns([1.2, 1])
+        u_col1, u_col2 = st.columns([1.25, 1])
         with u_col1:
             st.markdown("#### Latest Progress Report (`project/progress.json`)")
             if ev.progress:
@@ -245,7 +253,16 @@ def render_team_workspace_page(
                         }
                         for m in ev.progress.milestones
                     ]
-                    st.dataframe(pd.DataFrame(ms_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        pd.DataFrame(ms_rows),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Completion (%)": st.column_config.ProgressColumn(
+                                "Completion (%)", min_value=0, max_value=100, format="%.0f%%"
+                            )
+                        },
+                    )
             else:
                 st.info("`project/progress.json` has not been submitted yet.")
 
@@ -461,7 +478,9 @@ def _render_workspace_json_editors(
                     branch=ev.snapshot.default_branch,
                 )
                 if local_store:
-                    local_store.log_audit_event(user.username, user.role.value, "commit_metadata_json", selected_repo, msg)
+                    local_store.log_audit_event(
+                        user.username, user.role.value, "commit_metadata_json", selected_repo, msg
+                    )
                 if ok:
                     st.success(msg)
                     st.rerun()
@@ -486,7 +505,9 @@ def _render_workspace_json_editors(
         if m_ids:
             m_actions.extend(["Update Existing Member", "Remove Member"])
 
-        m_mode = st.radio("Member Action", options=m_actions, horizontal=True, key=f"mem_mode_{selected_repo}")
+        m_mode = st.radio(
+            "Member Action", options=m_actions, horizontal=True, key=f"mem_mode_{selected_repo}"
+        )
 
         if m_mode == "Remove Member" and m_ids:
             rem_id = st.selectbox(
@@ -507,7 +528,9 @@ def _render_workspace_json_editors(
                     branch=ev.snapshot.default_branch,
                 )
                 if local_store:
-                    local_store.log_audit_event(user.username, user.role.value, "remove_member_json", selected_repo, msg)
+                    local_store.log_audit_event(
+                        user.username, user.role.value, "remove_member_json", selected_repo, msg
+                    )
                 if ok:
                     st.success(msg)
                     st.rerun()
@@ -527,9 +550,13 @@ def _render_workspace_json_editors(
             )
             sel_mem = next((m for m in existing_members if m["member_id"] == chosen_mid), None)
 
-        default_mid = sel_mem["member_id"] if sel_mem else f"M{len(existing_members) + 1}"
+        if sel_mem:
+            default_mid = sel_mem["member_id"]
+        else:
+            mem_nums = [int("".join(c for c in m["member_id"] if c.isdigit())) for m in existing_members if any(c.isdigit() for c in m["member_id"])]
+            default_mid = f"M{(max(mem_nums) + 1) if mem_nums else 1}"
 
-        with st.form(f"member_editor_form_{selected_repo}"):
+        with st.form(f"member_editor_form_{selected_repo}_{m_mode}_{default_mid}"):
             c1, c2, c3 = st.columns([1, 2, 1.5])
             m_id = c1.text_input("Member ID", value=default_mid)
             m_name = c2.text_input("Full Name", value=sel_mem["name"] if sel_mem else "")
@@ -579,7 +606,9 @@ def _render_workspace_json_editors(
                         branch=ev.snapshot.default_branch,
                     )
                     if local_store:
-                        local_store.log_audit_event(user.username, user.role.value, "commit_members_json", selected_repo, msg)
+                        local_store.log_audit_event(
+                            user.username, user.role.value, "commit_members_json", selected_repo, msg
+                        )
                     if ok:
                         st.success(msg)
                         st.rerun()
@@ -611,11 +640,21 @@ def _render_workspace_json_editors(
                 )
             ),
         )
-        sel_r = None if pick_r.startswith("+") else next((r for r in existing_resps if r["member_id"] == pick_r), None)
+        sel_r = (
+            None
+            if pick_r.startswith("+")
+            else next((r for r in existing_resps if r["member_id"] == pick_r), None)
+        )
 
-        with st.form(f"resp_editor_form_{selected_repo}"):
+        if sel_r:
+            default_rid = sel_r["member_id"]
+        else:
+            r_nums = [int("".join(c for c in r["member_id"] if c.isdigit())) for r in existing_resps if any(c.isdigit() for c in r["member_id"])]
+            default_rid = f"M{(max(r_nums) + 1) if r_nums else 1}"
+
+        with st.form(f"resp_editor_form_{selected_repo}_{pick_r}"):
             c1, c2, c3 = st.columns([1, 1.8, 1.8])
-            r_id = c1.text_input("Member ID", value=sel_r["member_id"] if sel_r else f"M{len(existing_resps) + 1}")
+            r_id = c1.text_input("Member ID", value=default_rid)
             r_name = c2.text_input("Member Name", value=sel_r["name"] if sel_r else "")
             r_area = c3.text_input(
                 "Primary Ownership Area",
@@ -667,7 +706,9 @@ def _render_workspace_json_editors(
                         branch=ev.snapshot.default_branch,
                     )
                     if local_store:
-                        local_store.log_audit_event(user.username, user.role.value, "commit_responsibilities_json", selected_repo, msg)
+                        local_store.log_audit_event(
+                            user.username, user.role.value, "commit_responsibilities_json", selected_repo, msg
+                        )
                     if ok:
                         st.success(msg)
                         st.rerun()

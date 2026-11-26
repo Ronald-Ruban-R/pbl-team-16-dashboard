@@ -272,6 +272,7 @@ class GitHubCohortClient:
         self.session = session or requests.Session()
         self.rate_limit = RateLimitStatus()
         self._cache: Dict[str, Tuple[float, Any]] = {}
+        self._recent_writes: Dict[Tuple[str, str], Tuple[float, FileContentResult]] = {}
 
     def clear_cache(self, repo_name: Optional[str] = None) -> None:
         if repo_name is None:
@@ -357,6 +358,7 @@ class GitHubCohortClient:
             "Accept": accept,
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "PBL-Cohort-X-Dashboard/2.0",
+            "Cache-Control": "no-cache",
         }
 
         last_error = None
@@ -731,8 +733,28 @@ class GitHubCohortClient:
         recent_commits, _ = self.fetch_recent_commits(repo_name, branch=default_branch, max_commits=15)
 
         convention_results: Dict[str, FileContentResult] = {}
-        paths_to_fetch: List[str] = []
+        # Map canonical key -> actual path on GitHub (handles case differences like Tasks/tasks.json)
+        paths_to_fetch: Dict[str, str] = {}
+        now_ts = time.time()
+
         for _, rel_path in CONVENTION_FILES.items():
+            recent_key = (repo_name.lower(), rel_path.lower())
+            recent_entry = self._recent_writes.get(recent_key)
+            if recent_entry and now_ts < recent_entry[0]:
+                convention_results[rel_path] = recent_entry[1]
+                if rel_path.lower() not in existing_paths:
+                    synthetic_entry = RepoFileEntry(
+                        name=rel_path.rsplit("/", 1)[-1],
+                        path=rel_path,
+                        item_type="file",
+                        size=recent_entry[1].size,
+                        sha=recent_entry[1].sha,
+                        html_url=recent_entry[1].html_url,
+                    )
+                    tree_entries.append(synthetic_entry)
+                    existing_paths[rel_path.lower()] = synthetic_entry
+                continue
+
             if existing_paths and rel_path.lower() not in existing_paths:
                 convention_results[rel_path] = FileContentResult(
                     repo_name=repo_name,
@@ -742,7 +764,8 @@ class GitHubCohortClient:
                     error_message="File not present in repository.",
                 )
             else:
-                paths_to_fetch.append(rel_path)
+                actual_path = existing_paths[rel_path.lower()].path if rel_path.lower() in existing_paths else rel_path
+                paths_to_fetch[rel_path] = actual_path
 
         for entry in tree_entries:
             if (
@@ -751,24 +774,26 @@ class GitHubCohortClient:
                 and entry.path.lower().endswith(".json")
                 and entry.path not in convention_results
                 and entry.path not in paths_to_fetch
+                and entry.path.lower() not in {k.lower() for k in convention_results}
+                and entry.path.lower() not in {k.lower() for k in paths_to_fetch}
             ):
-                paths_to_fetch.append(entry.path)
+                paths_to_fetch[entry.path] = entry.path
 
         if paths_to_fetch:
             with ThreadPoolExecutor(max_workers=min(6, len(paths_to_fetch))) as pool:
                 future_map = {
-                    p: pool.submit(self.fetch_file_content, repo_name, p, default_branch)
-                    for p in paths_to_fetch
+                    canonical_p: pool.submit(self.fetch_file_content, repo_name, actual_p, default_branch)
+                    for canonical_p, actual_p in paths_to_fetch.items()
                 }
-                for p, fut in future_map.items():
+                for canonical_p, fut in future_map.items():
                     try:
-                        convention_results[p] = fut.result()
+                        convention_results[canonical_p] = fut.result()
                     except Exception as exc:
-                        convention_results[p] = FileContentResult(
+                        convention_results[canonical_p] = FileContentResult(
                             repo_name=repo_name,
-                            path=p,
+                            path=canonical_p,
                             exists=False,
-                            html_url=f"{html_url}/blob/{default_branch}/{p}",
+                            html_url=f"{html_url}/blob/{default_branch}/{canonical_p}",
                             error_message=redact_secrets(str(exc)),
                         )
 
@@ -823,27 +848,57 @@ class GitHubCohortClient:
         encoded_path = "/".join(quote(seg) for seg in clean_path.split("/") if seg)
         endpoint = f"/repos/{quote(self.config.github_org)}/{quote(repo_name)}/contents/{encoded_path}"
 
-        existing_sha: Optional[str] = None
-        get_status, get_data, _, _ = self._request("GET", endpoint, params={"ref": branch})
-        if get_status == 200 and isinstance(get_data, dict):
-            existing_sha = get_data.get("sha")
-
         formatted_json = json.dumps(json_payload, indent=2, ensure_ascii=False) + "\n"
-        b64_content = base64.b64encode(formatted_json.encode("utf-8")).decode("ascii")
+        raw_bytes = formatted_json.encode("utf-8")
+        b64_content = base64.b64encode(raw_bytes).decode("ascii")
 
-        body: Dict[str, Any] = {
-            "message": commit_message,
-            "content": b64_content,
-            "branch": branch,
-        }
-        if existing_sha:
-            body["sha"] = existing_sha
+        put_status = 0
+        put_data: Any = None
+        put_err: Optional[str] = None
+        existing_sha: Optional[str] = None
 
-        put_status, _, _, put_err = self._request("PUT", endpoint, json_body=body)
-        if put_status in (200, 201):
-            self.clear_cache(repo_name)
-            action_word = "Updated" if existing_sha else "Created"
-            return True, f"{action_word} `{clean_path}` in `{repo_name}` (`{branch}`)."
+        for _attempt in range(2):
+            existing_sha = None
+            get_status, get_data, _, _ = self._request("GET", endpoint, params={"ref": branch})
+            if get_status == 200 and isinstance(get_data, dict):
+                existing_sha = get_data.get("sha")
+
+            body: Dict[str, Any] = {
+                "message": commit_message,
+                "content": b64_content,
+                "branch": branch,
+            }
+            if existing_sha:
+                body["sha"] = existing_sha
+
+            put_status, put_data, _, put_err = self._request("PUT", endpoint, json_body=body)
+            if put_status in (200, 201):
+                new_sha = ""
+                new_html_url = f"https://github.com/{self.config.github_org}/{repo_name}/blob/{branch}/{clean_path}"
+                if isinstance(put_data, dict) and isinstance(put_data.get("content"), dict):
+                    new_sha = str(put_data["content"].get("sha") or "")
+                    new_html_url = str(put_data["content"].get("html_url") or new_html_url)
+
+                fresh_res = FileContentResult(
+                    repo_name=repo_name,
+                    path=clean_path,
+                    exists=True,
+                    size=len(raw_bytes),
+                    sha=new_sha,
+                    raw_bytes=raw_bytes,
+                    text_content=formatted_json,
+                    html_url=new_html_url,
+                    is_binary=False,
+                )
+                # Keep a 20-second read-your-own-writes overlay so immediate st.rerun() never shows stale CDN data
+                self._recent_writes[(repo_name.lower(), clean_path.lower())] = (time.time() + 20.0, fresh_res)
+                self.clear_cache(repo_name)
+                action_word = "Updated" if existing_sha else "Created"
+                return True, f"{action_word} `{clean_path}` in `{repo_name}` (`{branch}`)."
+
+            if put_status != 409:
+                break
+            time.sleep(0.4)
 
         return (
             False,

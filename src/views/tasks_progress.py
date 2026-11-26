@@ -22,7 +22,12 @@ from src.config import DashboardConfig
 from src.github_client import GitHubCohortClient
 from src.security import AccessControlManager, AuthenticatedUser
 from src.storage import MentorLocalStore
-from src.ui_theme import format_bool_indicator, format_task_status
+from src.ui_theme import (
+    format_bool_indicator,
+    format_task_status,
+    render_page_header,
+    style_plotly_figure,
+)
 from src.validators import VALID_TASK_PRIORITIES, VALID_TASK_STATUSES
 
 
@@ -35,10 +40,12 @@ def render_tasks_progress_page(
     config: DashboardConfig | None = None,
 ) -> None:
     """Render the Tasks, Member Contributions & Live GitHub Sync page."""
-    st.markdown("## Tasks, Member Contributions & Progress Sync")
-    st.caption(
-        "Track itemized task execution, verify repository evidence links, analyze member contributions, "
-        "and commit task or progress updates directly to GitHub."
+    render_page_header(
+        title="Tasks, Member Contributions & Progress Sync",
+        subtitle=(
+            "Track itemized task execution, verify repository evidence links, analyze member contributions, "
+            "and commit task or progress updates directly to GitHub."
+        ),
     )
 
     authorized_repos = [r for r in evaluations.keys() if user.can_access_repo(r)]
@@ -87,10 +94,15 @@ def render_tasks_progress_page(
     # ------------------------------------------------------------------
     with tab_board:
         if not ev.tasks:
-            st.info(
-                f"No tasks recorded in `tasks/tasks.json` for `{selected_repo}`. "
-                "Team Leads (`role = \"owner\"`) can add tasks in the 'Edit Tasks, Progress & Milestones' tab."
-            )
+            task_issues = [v for v in ev.validation_issues if "tasks.json" in v.file_path]
+            if task_issues:
+                for vi in task_issues:
+                    st.warning(f"`{vi.file_path}`: {vi.message}")
+            else:
+                st.info(
+                    f"No tasks recorded in `tasks/tasks.json` for `{selected_repo}`. "
+                    "Team Leads (`role = \"owner\"`) can add tasks in the 'Edit Tasks, Progress & Milestones' tab."
+                )
         else:
             f1, f2, f3 = st.columns(3)
             assignees = sorted({t.assigned_to for t in ev.tasks if t.assigned_to})
@@ -169,7 +181,16 @@ def render_tasks_progress_page(
                 for ms in ev.member_stats
             ]
             m_df = pd.DataFrame(mem_rows)
-            st.dataframe(m_df, use_container_width=True, hide_index=True)
+            st.dataframe(
+                m_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Completion Rate (%)": st.column_config.ProgressColumn(
+                        "Completion Rate (%)", min_value=0, max_value=100, format="%.1f%%"
+                    )
+                },
+            )
 
             fig = px.bar(
                 m_df,
@@ -183,8 +204,7 @@ def render_tasks_progress_page(
                     "Blocked": "#DC2626",
                 },
             )
-            fig.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(style_plotly_figure(fig, height=320), use_container_width=True)
 
     # ------------------------------------------------------------------
     # Tab 3: Milestone Weights & Progress Discrepancy
@@ -205,7 +225,16 @@ def render_tasks_progress_page(
                 }
                 for m in ev.progress.milestones
             ]
-            st.dataframe(pd.DataFrame(ms_rows), use_container_width=True, hide_index=True)
+            st.dataframe(
+                pd.DataFrame(ms_rows),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Completion (%)": st.column_config.ProgressColumn(
+                        "Completion (%)", min_value=0, max_value=100, format="%.0f%%"
+                    )
+                },
+            )
 
             if user.can_write_feedback(selected_repo):
                 with st.expander("Customize Local Milestone Evaluation Weights", expanded=False):
@@ -356,9 +385,18 @@ def _render_tasks_json_editor(
         selected_existing = next((t for t in ev_edit.tasks if t.task_id == chosen_id), None)
 
     member_names = [m.name for m in ev_edit.members] if ev_edit.members else []
-    default_id = selected_existing.task_id if selected_existing else f"T-{101 + len(ev_edit.tasks)}"
+    if selected_existing:
+        default_id = selected_existing.task_id
+    else:
+        used_nums = []
+        for t_item in ev_edit.tasks:
+            digits = "".join(ch for ch in t_item.task_id if ch.isdigit())
+            if digits:
+                used_nums.append(int(digits))
+        next_num = max(used_nums) + 1 if used_nums else 101
+        default_id = f"T-{next_num}"
 
-    with st.form(f"task_editor_form_{edit_repo}"):
+    with st.form(f"task_editor_form_{edit_repo}_{mode}_{default_id}"):
         c_id, c_title = st.columns([1, 3])
         t_id = c_id.text_input("Task ID", value=default_id)
         t_title = c_title.text_input(
@@ -655,9 +693,15 @@ def _render_milestones_json_editor(
     )
     sel_m = None if pick_m.startswith("+") else next((m for m in current_ms if m["milestone_id"] == pick_m), None)
 
-    with st.form(f"milestone_json_form_{edit_repo}"):
+    if sel_m:
+        default_mid = sel_m["milestone_id"]
+    else:
+        m_nums = [int("".join(c for c in m["milestone_id"] if c.isdigit())) for m in current_ms if any(c.isdigit() for c in m["milestone_id"])]
+        default_mid = f"M{(max(m_nums) + 1) if m_nums else 1}"
+
+    with st.form(f"milestone_json_form_{edit_repo}_{pick_m}"):
         c1, c2, c3 = st.columns([1, 2.5, 1.2])
-        m_id = c1.text_input("Milestone ID", value=sel_m["milestone_id"] if sel_m else f"M{len(current_ms) + 1}")
+        m_id = c1.text_input("Milestone ID", value=default_mid)
         m_title = c2.text_input("Milestone Title", value=sel_m["title"] if sel_m else "")
         m_status = c3.selectbox(
             "Status",
